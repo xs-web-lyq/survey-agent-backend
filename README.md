@@ -77,6 +77,10 @@ python -m uvicorn backend.server:app \
 前后端分离部署时使用 `CORS_ORIGINS` 配置精确来源；同源部署可留空。生产环境
 禁止配置通配符 `*`，否则 `/readyz` 会报告配置未就绪。
 
+RAG 默认懒初始化，以保证健康端点和管理接口在进程启动后立即响应。若部署环境
+有明确维护窗口，可设置 `STARTUP_RAG_WARMUP=true`；预热期间 `/readyz` 返回 503，
+失败状态不会被伪装成 ready。
+
 开发检查：
 
 ```bash

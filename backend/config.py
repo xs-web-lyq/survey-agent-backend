@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     server_port: int = 8000
     app_env: str = "development"
     debug: bool = False
-    startup_rag_warmup: bool = True
+    startup_rag_warmup: bool = False
     cors_origins_raw: str = Field(
         default="http://127.0.0.1:8000,http://localhost:8000",
         alias="CORS_ORIGINS",
