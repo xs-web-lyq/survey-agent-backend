@@ -68,6 +68,7 @@ def _load_rag_dependencies() -> None:
 
 _rag: Any | None = None
 _init_lock = threading.Lock()
+_async_init_lock = asyncio.Lock()
 
 
 def llm_model_func(prompt, system_prompt=None, history_messages=None, **kwargs):
@@ -128,37 +129,50 @@ def _build_embedding_func() -> Any:
 async def get_rag() -> Any:
     """获取全局 RAGAnything 单例(懒初始化,只读打开既有 KB)。"""
     global _rag
+    from backend.health import runtime_health
+
     if _rag is not None:
+        runtime_health.set_rag("ready")
         return _rag
 
-    _load_rag_dependencies()
+    async with _async_init_lock:
+        if _rag is not None:
+            runtime_health.set_rag("ready")
+            return _rag
+        runtime_health.set_rag("warming")
+        try:
+            _load_rag_dependencies()
 
-    errors = settings.validate_paths()
-    if errors:
-        raise RuntimeError("配置路径错误:\n" + "\n".join(errors))
+            errors = settings.validate_paths()
+            if errors:
+                raise RuntimeError("配置路径错误:\n" + "\n".join(errors))
 
-    embedding_func = _build_embedding_func()
+            embedding_func = _build_embedding_func()
 
-    logger.info("预初始化 LightRAG(KB: %s)...", settings.kb_name)
-    lightrag = LightRAG(
-        working_dir=str(settings.rag_storage_dir),
-        llm_model_func=llm_model_func,
-        embedding_func=embedding_func,
-    )
-    await lightrag.initialize_storages()
+            logger.info("预初始化 LightRAG(KB: %s)...", settings.kb_name)
+            lightrag = LightRAG(
+                working_dir=str(settings.rag_storage_dir),
+                llm_model_func=llm_model_func,
+                embedding_func=embedding_func,
+            )
+            await lightrag.initialize_storages()
 
-    config = RAGAnythingConfig(
-        working_dir=str(settings.rag_storage_dir),
-        parser="mineru",  # 占位;传入预初始化 lightrag 后不会触发解析
-    )
-    _rag = RAGAnything(
-        config=config,
-        llm_model_func=llm_model_func,
-        embedding_func=embedding_func,
-        lightrag=lightrag,
-    )
-    logger.info("RAGAnything 就绪(KB: %s)", settings.kb_name)
-    return _rag
+            config = RAGAnythingConfig(
+                working_dir=str(settings.rag_storage_dir),
+                parser="mineru",  # 占位;传入预初始化 lightrag 后不会触发解析
+            )
+            _rag = RAGAnything(
+                config=config,
+                llm_model_func=llm_model_func,
+                embedding_func=embedding_func,
+                lightrag=lightrag,
+            )
+        except Exception as exc:
+            runtime_health.set_rag("failed", type(exc).__name__)
+            raise
+        runtime_health.set_rag("ready")
+        logger.info("RAGAnything 就绪(KB: %s)", settings.kb_name)
+        return _rag
 
 
 def get_rag_sync() -> Any:
