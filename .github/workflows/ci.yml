@@ -16,6 +16,7 @@ jobs:
       DATA_DIR: .ci/data
       WORKSPACE_DIR: .ci/workspace
       FRONTEND_DIST_DIR: .ci/frontend-dist
+      STARTUP_RAG_WARMUP: 'false'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

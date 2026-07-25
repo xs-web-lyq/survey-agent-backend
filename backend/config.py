@@ -62,6 +62,15 @@ class Settings(BaseSettings):
     # ---- 服务 ----
     server_host: str = "0.0.0.0"
     server_port: int = 8000
+    app_env: str = "development"
+    debug: bool = False
+    startup_rag_warmup: bool = True
+    cors_origins_raw: str = Field(
+        default="http://127.0.0.1:8000,http://localhost:8000",
+        alias="CORS_ORIGINS",
+    )
+    admin_token: str = ""
+    model_preflight_timeout_seconds: float = 15.0
 
     @property
     def effective_writer_model(self) -> str:
@@ -71,6 +80,14 @@ class Settings(BaseSettings):
     def parser_output_dirs(self) -> list[Path]:
         return [Path(p.strip()) for p in self.parser_output_dirs_raw.split(";")
                 if p.strip()]
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_origins_raw.split(",") if origin.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.lower() == "production"
 
     @property
     def kb_name(self) -> str:

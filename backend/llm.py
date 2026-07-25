@@ -225,3 +225,36 @@ def stream(
     if _is_anthropic():
         return _anthropic_stream(system, user, model=m, history=history)
     return _openai_stream(system, user, model=m, history=history)
+
+
+async def preflight(timeout_seconds: float | None = None) -> dict[str, Any]:
+    """Perform a minimal, explicitly requested provider/model permission check."""
+    timeout = timeout_seconds or settings.model_preflight_timeout_seconds
+
+    async def probe() -> str:
+        if _is_anthropic():
+            response = await _anthropic_client().messages.create(
+                model=settings.llm_model,
+                max_tokens=4,
+                system="",
+                messages=[{"role": "user", "content": "Reply OK"}],
+            )
+            return "".join(block.text for block in response.content if block.type == "text")
+        response = await _openai_client().chat.completions.create(
+            model=settings.llm_model,
+            messages=[{"role": "user", "content": "Reply OK"}],
+            max_tokens=4,
+            extra_body={"enable_thinking": False},
+        )
+        return response.choices[0].message.content or ""
+
+    started = asyncio.get_running_loop().time()
+    text = await asyncio.wait_for(probe(), timeout=timeout)
+    elapsed = int((asyncio.get_running_loop().time() - started) * 1000)
+    return {
+        "ok": True,
+        "binding": settings.llm_binding_type,
+        "model": settings.llm_model,
+        "latency_ms": elapsed,
+        "response_received": bool(text.strip()),
+    }

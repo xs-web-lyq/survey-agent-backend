@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
+
+logger = logging.getLogger(__name__)
 
 # 事件类型常量(前端/CLI 依据 type 渲染)
 PHASE = "phase"                    # {name, status: start|end}
@@ -98,7 +101,10 @@ class EventBus:
             with open(self.jsonl_path, "a", encoding="utf-8") as f:
                 f.write(ev.to_json() + "\n")
         if self.on_emit:
-            self.on_emit(ev)
+            try:
+                self.on_emit(ev)
+            except Exception:
+                logger.exception("event persistence hook failed task_id=%s", self.task_id)
         self._queue.put_nowait(ev)
         return ev
 

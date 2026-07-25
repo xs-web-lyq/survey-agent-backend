@@ -6,12 +6,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 import uuid
 from typing import Any
 
 from backend.config import settings
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -102,6 +105,19 @@ def init_db() -> None:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def database_status() -> dict[str, Any]:
+    from backend.migrations import current_version
+
+    try:
+        with _connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+            version = current_version(conn)
+        return {"ok": True, "schema_version": version}
+    except sqlite3.Error:
+        logger.exception("database health check failed")
+        return {"ok": False, "schema_version": None}
 
 
 # ---------- conversations ----------

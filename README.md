@@ -63,6 +63,20 @@ python -m uvicorn backend.server:app \
   --workers 1
 ```
 
+生产环境建议在 systemd `EnvironmentFile` 或密钥管理服务中注入配置，不要把
+`.env`、API Key、数据库和 workspace 上传到仓库。保持 `--workers 1`，因为当前
+实时事件总线与任务管理器使用进程内状态。
+
+健康检查分为三层：
+
+- `GET /healthz`：仅判断进程存活，不加载 RAG、不调用模型。
+- `GET /readyz`：检查数据库、必要路径和 RAG 预热状态；未就绪时返回 503。
+- `POST /api/admin/preflight/model`：显式执行一次低 token 模型权限预检。生产环境
+  必须配置 `ADMIN_TOKEN`，并通过 `X-Admin-Token` 请求头调用。
+
+前后端分离部署时使用 `CORS_ORIGINS` 配置精确来源；同源部署可留空。生产环境
+禁止配置通配符 `*`，否则 `/readyz` 会报告配置未就绪。
+
 开发检查：
 
 ```bash

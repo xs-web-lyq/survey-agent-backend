@@ -8,13 +8,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from contextlib import asynccontextmanager
+import uuid
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -22,6 +23,7 @@ from sse_starlette.sse import EventSourceResponse
 from backend import db
 from backend.config import PROJECT_ROOT, settings
 from backend.events import EventBus
+from backend.health import admin_access_status, readiness_snapshot, runtime_health
 from backend.pipelines.qa import ROUTES, run_qa
 
 logger = logging.getLogger(__name__)
@@ -29,23 +31,115 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 预热:启动时初始化 RAG(embedding 模型加载较慢,避免首问超时)
-    from backend.rag_client import get_rag
-    try:
-        await get_rag()
-        logger.info("RAG 预热完成")
-    except Exception:
-        logger.exception("RAG 预热失败(首次请求时将重试)")
+    async def warm_rag() -> None:
+        from backend.rag_client import get_rag
+
+        runtime_health.set_rag("warming")
+        try:
+            await get_rag()
+            runtime_health.set_rag("ready")
+            logger.info("RAG 预热完成")
+        except Exception as exc:
+            runtime_health.set_rag("failed", type(exc).__name__)
+            logger.exception("RAG 预热失败，readyz 将保持不可用")
+
+    warmup_task: asyncio.Task | None = None
+    if settings.startup_rag_warmup:
+        warmup_task = asyncio.create_task(warm_rag())
+    else:
+        runtime_health.set_rag("deferred")
     yield
+    if warmup_task and not warmup_task.done():
+        warmup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await warmup_task
 
 
-app = FastAPI(title="Research Copilot", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 开发期放开;生产同源部署,无跨域
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Research Copilot", lifespan=lifespan, debug=settings.debug)
+if settings.cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type", "Authorization", "X-Admin-Token"],
+    )
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:16]
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception(request: Request, exc: Exception):
+    request_id = getattr(request.state, "request_id", uuid.uuid4().hex[:16])
+    logger.exception("unhandled request error request_id=%s", request_id)
+    detail = (
+        str(exc)
+        if settings.debug and not settings.is_production
+        else "服务器内部错误，请稍后重试。"
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": detail, "request_id": request_id},
+        headers={"X-Request-ID": request_id},
+    )
+
+
+# ---------------- 健康检查与预检 ----------------
+
+@app.get("/healthz")
+async def healthz():
+    """Process liveness only; never initializes or calls a model."""
+    return {"status": "ok", "service": "survey-agent-backend"}
+
+
+@app.get("/readyz")
+async def readyz():
+    """Traffic readiness: database, configured paths and RAG warmup state."""
+    ready, components = readiness_snapshot()
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "ready" if ready else "not_ready", "components": components},
+    )
+
+
+def _verify_admin_access(token: str | None) -> None:
+    allowed, status_code, message = admin_access_status(token)
+    if not allowed:
+        raise HTTPException(status_code, message)
+
+
+@app.post("/api/admin/preflight/model")
+async def model_preflight(
+    admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Explicit low-token provider/model permission check with a hard timeout."""
+    from backend import llm
+
+    _verify_admin_access(admin_token)
+    try:
+        return await llm.preflight()
+    except TimeoutError:
+        logger.warning("model preflight timed out model=%s", settings.llm_model)
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "code": "timeout", "message": "模型预检超时。"},
+        )
+    except Exception as exc:
+        logger.exception("model preflight failed model=%s", settings.llm_model)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "code": type(exc).__name__,
+                "message": "模型、权限或账户状态预检失败，请检查服务端配置。",
+            },
+        )
 
 
 # ---------------- 问答 ----------------
