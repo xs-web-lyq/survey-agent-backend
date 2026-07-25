@@ -1,0 +1,32 @@
+name: backend-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      RAG_ANYTHING_REPO: .ci/rag-anything
+      RAG_STORAGE_DIR: .ci/rag-storage
+      LLM_BINDING_API_KEY: test-key
+      LLM_BINDING_HOST: https://example.invalid/v1
+      DATA_DIR: .ci/data
+      WORKSPACE_DIR: .ci/workspace
+      FRONTEND_DIST_DIR: .ci/frontend-dist
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+      - name: Prepare isolated paths
+        run: mkdir -p .ci/rag-anything .ci/rag-storage .ci/data .ci/workspace .ci/frontend-dist
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Compile application
+        run: python -m compileall -q backend tests
+      - name: Run offline tests
+        run: python -m pytest -q

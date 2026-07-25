@@ -28,13 +28,45 @@ _repo = str(settings.rag_anything_repo)
 if _repo not in sys.path:
     sys.path.insert(0, _repo)
 
-# 注入后才能导入
-from lightrag import LightRAG, QueryParam  # noqa: E402
-from lightrag.llm.openai import openai_complete_if_cache  # noqa: E402
-from lightrag.utils import EmbeddingFunc  # noqa: E402
-from raganything import RAGAnything, RAGAnythingConfig  # noqa: E402
+# RAG dependencies are loaded only for real retrieval. Unit tests, database
+# migrations and liveness checks therefore do not require the external repo.
+LightRAG = None
+QueryParam = None
+openai_complete_if_cache = None
+EmbeddingFunc = None
+RAGAnything = None
+RAGAnythingConfig = None
 
-_rag: RAGAnything | None = None
+
+def _load_rag_dependencies() -> None:
+    global LightRAG, QueryParam, openai_complete_if_cache
+    global EmbeddingFunc, RAGAnything, RAGAnythingConfig
+    if RAGAnything is not None:
+        return
+    try:
+        from lightrag import LightRAG as _LightRAG, QueryParam as _QueryParam
+        from lightrag.llm.openai import (
+            openai_complete_if_cache as _openai_complete_if_cache,
+        )
+        from lightrag.utils import EmbeddingFunc as _EmbeddingFunc
+        from raganything import (
+            RAGAnything as _RAGAnything,
+            RAGAnythingConfig as _RAGAnythingConfig,
+        )
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "RAG-Anything dependencies are unavailable; verify "
+            "RAG_ANYTHING_REPO and its Python environment"
+        ) from exc
+    LightRAG = _LightRAG
+    QueryParam = _QueryParam
+    openai_complete_if_cache = _openai_complete_if_cache
+    EmbeddingFunc = _EmbeddingFunc
+    RAGAnything = _RAGAnything
+    RAGAnythingConfig = _RAGAnythingConfig
+
+
+_rag: Any | None = None
 _init_lock = threading.Lock()
 
 
@@ -51,6 +83,7 @@ def llm_model_func(prompt, system_prompt=None, history_messages=None, **kwargs):
             system_prompt, prompt,
             history=list(history_messages or []),
         )
+    _load_rag_dependencies()
     return openai_complete_if_cache(
         settings.llm_model,
         prompt,
@@ -62,7 +95,7 @@ def llm_model_func(prompt, system_prompt=None, history_messages=None, **kwargs):
     )
 
 
-def _build_embedding_func() -> EmbeddingFunc:
+def _build_embedding_func() -> Any:
     import os
 
     # 模型已缓存本地;避免每次启动联网校验 HF(国内访问超时会刷屏重试)
@@ -84,6 +117,7 @@ def _build_embedding_func() -> EmbeddingFunc:
             show_progress_bar=False,
         )
 
+    _load_rag_dependencies()
     return EmbeddingFunc(
         embedding_dim=settings.embedding_dim,
         max_token_size=512,
@@ -91,11 +125,13 @@ def _build_embedding_func() -> EmbeddingFunc:
     )
 
 
-async def get_rag() -> RAGAnything:
+async def get_rag() -> Any:
     """获取全局 RAGAnything 单例(懒初始化,只读打开既有 KB)。"""
     global _rag
     if _rag is not None:
         return _rag
+
+    _load_rag_dependencies()
 
     errors = settings.validate_paths()
     if errors:
@@ -125,7 +161,7 @@ async def get_rag() -> RAGAnything:
     return _rag
 
 
-def get_rag_sync() -> RAGAnything:
+def get_rag_sync() -> Any:
     """同步入口(CLI/自检用)。"""
     with _init_lock:
         try:
