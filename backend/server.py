@@ -421,6 +421,36 @@ async def brainstorm_conclude(conv_id: str):
 @app.get("/api/conversations")
 async def conversations():
     return db.list_conversations()
+
+
+@app.get("/api/trash/conversations")
+async def deleted_conversations():
+    return db.list_deleted_conversations()
+
+
+@app.post("/api/trash/conversations/{conv_id}/restore")
+async def restore_conversation(conv_id: str):
+    if not db.restore_conversation(conv_id):
+        raise HTTPException(404, "deleted conversation not found")
+    return {"id": conv_id, "restored": True}
+
+
+@app.delete("/api/trash/conversations/{conv_id}")
+async def purge_conversation(
+    conv_id: str,
+    delete_durable_memories: bool = False,
+):
+    if not db.purge_conversation(
+        conv_id, delete_durable_memories=delete_durable_memories,
+    ):
+        raise HTTPException(404, "deleted conversation not found")
+    return {
+        "id": conv_id,
+        "purged": True,
+        "durable_memories_deleted": delete_durable_memories,
+    }
+
+
 @app.get("/api/conversations/{conv_id}")
 async def conversation_detail(conv_id: str):
     conv = db.get_conversation(conv_id)
@@ -450,7 +480,7 @@ async def update_conversation(conv_id: str, req: ConversationUpdateRequest):
 async def delete_conversation(conv_id: str):
     if not db.delete_conversation(conv_id):
         raise HTTPException(404, "conversation not found")
-    return {"id": conv_id, "deleted": True}
+    return {"id": conv_id, "deleted": True, "moved_to_trash": True}
 
 
 @app.get("/api/conversations/{conv_id}/export.md")

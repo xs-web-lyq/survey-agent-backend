@@ -86,8 +86,18 @@ CREATE TABLE IF NOT EXISTS conversation_lineage (
 """
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(settings.data_dir / "feedback.db")
+    conn = sqlite3.connect(
+        settings.data_dir / "feedback.db", factory=_ClosingConnection,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn

@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     id         TEXT PRIMARY KEY,
     title      TEXT NOT NULL DEFAULT '',
     kb_name    TEXT NOT NULL DEFAULT '',
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    deleted_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -92,24 +93,11 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    from backend.migrations import apply_migrations
+
     with _connect() as conn:
         conn.executescript(_SCHEMA)
-        # P0-A compatibility path for databases created before run persistence.
-        # P0-B replaces this bootstrap with versioned schema migrations.
-        _ensure_column(conn, "messages", "status", "TEXT NOT NULL DEFAULT 'completed'")
-        _ensure_column(conn, "messages", "error_json", "TEXT DEFAULT '{}'")
-        _ensure_column(conn, "messages", "run_id", "TEXT DEFAULT ''")
-
-
-def _ensure_column(
-    conn: sqlite3.Connection,
-    table: str,
-    column: str,
-    declaration: str,
-) -> None:
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+        apply_migrations(conn)
 
 
 def _new_id(prefix: str) -> str:
@@ -134,6 +122,7 @@ def list_conversations(limit: int = 50) -> list[dict[str, Any]]:
             """SELECT c.*, COUNT(m.id) AS message_count,
                       MAX(m.created_at) AS last_message_at
                FROM conversations c LEFT JOIN messages m ON m.conv_id = c.id
+               WHERE c.deleted_at IS NULL
                GROUP BY c.id ORDER BY COALESCE(last_message_at, c.created_at) DESC
                LIMIT ?""",
             (limit,),
@@ -141,10 +130,15 @@ def list_conversations(limit: int = 50) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-def get_conversation(conv_id: str) -> dict[str, Any] | None:
+def get_conversation(
+    conv_id: str,
+    *,
+    include_deleted: bool = False,
+) -> dict[str, Any] | None:
     with _connect() as conn:
+        deleted_clause = "" if include_deleted else " AND deleted_at IS NULL"
         row = conn.execute(
-            "SELECT * FROM conversations WHERE id=?", (conv_id,)
+            f"SELECT * FROM conversations WHERE id=?{deleted_clause}", (conv_id,)
         ).fetchone()
         if not row:
             return None
@@ -176,14 +170,52 @@ def update_conversation_title(conv_id: str, title: str) -> None:
 
 
 def delete_conversation(conv_id: str) -> bool:
-    """Delete a transcript and thread-scoped memory for one conversation.
+    """Move a conversation to the recycle bin without deleting its transcript."""
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE conversations SET deleted_at=? WHERE id=? AND deleted_at IS NULL",
+            (time.time(), conv_id),
+        )
+    return cursor.rowcount > 0
+
+
+def list_deleted_conversations(limit: int = 100) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT c.*, COUNT(m.id) AS message_count,
+                      MAX(m.created_at) AS last_message_at
+               FROM conversations c LEFT JOIN messages m ON m.conv_id = c.id
+               WHERE c.deleted_at IS NOT NULL
+               GROUP BY c.id ORDER BY c.deleted_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def restore_conversation(conv_id: str) -> bool:
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE conversations SET deleted_at=NULL WHERE id=? AND deleted_at IS NOT NULL",
+            (conv_id,),
+        )
+    return cursor.rowcount > 0
+
+
+def purge_conversation(
+    conv_id: str,
+    *,
+    delete_durable_memories: bool = False,
+) -> bool:
+    """Permanently delete a transcript and thread-scoped memory.
 
     Durable memories intentionally survive because they are user-level facts
-    that may have been learned from more than one conversation.
+    that may have been learned from more than one conversation, unless the
+    caller explicitly requests their deletion.
     """
     with _connect() as conn:
         exists = conn.execute(
-            "SELECT 1 FROM conversations WHERE id=?", (conv_id,)
+            "SELECT 1 FROM conversations WHERE id=? AND deleted_at IS NOT NULL",
+            (conv_id,),
         ).fetchone()
         if not exists:
             return False
@@ -192,6 +224,7 @@ def delete_conversation(conv_id: str) -> bool:
             "(SELECT id FROM messages WHERE conv_id=?)",
             (conv_id,),
         )
+        conn.execute("DELETE FROM turn_runs WHERE conv_id=?", (conv_id,))
         conn.execute("DELETE FROM messages WHERE conv_id=?", (conv_id,))
         scoped_tables = (
             ("memory_turns", "conv_id"),
@@ -208,6 +241,14 @@ def delete_conversation(conv_id: str) -> bool:
             ).fetchone()
             if present:
                 conn.execute(f"DELETE FROM {table} WHERE {column}=?", (conv_id,))
+        if delete_durable_memories:
+            present = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='durable_memories'"
+            ).fetchone()
+            if present:
+                conn.execute(
+                    "DELETE FROM durable_memories WHERE source_conv_id=?", (conv_id,)
+                )
         conn.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
     return True
 
