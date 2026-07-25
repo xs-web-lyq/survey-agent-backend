@@ -34,6 +34,9 @@ async def lifespan(app: FastAPI):
     async def warm_rag() -> None:
         from backend.rag_client import get_rag
 
+        # Let the ASGI lifespan yield first. RAG initialization performs heavy
+        # synchronous imports/model loading before its first internal await.
+        await asyncio.sleep(0.1)
         runtime_health.set_rag("warming")
         try:
             await get_rag()
