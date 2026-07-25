@@ -1,0 +1,12 @@
+# Research Copilot 独立依赖(RAG-Anything 本体经 RAG_ANYTHING_REPO 引入,不在此列)
+python-dotenv>=1.0
+pydantic-settings>=2.0
+fastapi>=0.110
+uvicorn[standard]>=0.29
+sse-starlette>=2.0
+openai>=1.30            # OpenAI 兼容 LLM 客户端
+anthropic>=0.40         # Anthropic messages 协议(中转站,LLM_BINDING_TYPE=anthropic)
+numpy
+sentence-transformers>=2.6
+rank-bm25>=0.2          # hybrid 链路 BM25
+jieba>=0.42             # 中文分词(BM25)

@@ -1,0 +1,32 @@
+# env & secrets
+.env
+
+# runtime artifacts
+workspace/
+data/
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# frontend
+frontend/node_modules/
+frontend/dist/
+
+# local release/build artifacts
+output/
+.runtime/
+.playwright-cli/
+*.out
+
+# IDE
+.idea/
+.vscode/
+
+# runtime logs
+*.err

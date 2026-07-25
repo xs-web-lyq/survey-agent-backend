@@ -1,0 +1,17 @@
+{
+  "example.pdf": {
+    "title": "确认后的题名",
+    "authors": ["作者1", "作者2"],
+    "year": 2025,
+    "journal": "期刊名称",
+    "volume": "65",
+    "volume_not_applicable": false,
+    "issue": "8",
+    "pages": "1162-1171",
+    "doi": "10.xxxx/xxxxx",
+    "institution": "学位授予单位",
+    "publication_place": "出版地（学位论文必填）",
+    "document_type": "journal",
+    "language": "zh"
+  }
+}
