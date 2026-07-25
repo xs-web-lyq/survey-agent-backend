@@ -57,67 +57,124 @@ class ChatRequest(BaseModel):
     deep: bool = False
 
 
-@app.post("/api/chat")
-async def chat(req: ChatRequest):
-    """问答:SSE 流式返回事件(text_delta/citations/route_info/...)。"""
-    if req.route not in ROUTES:
-        raise HTTPException(400, f"route 必须是 {ROUTES}")
+CHAT_TRACE_TYPES = {
+    "memory_loaded", "query_rewritten", "thinking", "route_info", "tool_call",
+    "tool_result", "deep_round", "memory_compacted", "memory_updated", "task_status",
+}
 
+
+def _chat_trace(bus: EventBus) -> list[dict]:
+    return [
+        {"type": ev.type, "data": ev.data, "ts": ev.ts}
+        for ev in bus.history if ev.type in CHAT_TRACE_TYPES
+    ]
+
+
+def _safe_chat_error(exc: Exception) -> dict[str, str]:
+    """Return a stable client-facing error without leaking provider internals."""
+    return {
+        "code": type(exc).__name__,
+        "message": "本轮问答执行失败，请稍后重试。",
+    }
+
+
+async def _start_chat_run(
+    *,
+    question: str,
+    route: str,
+    conv_id: str | None,
+    deep: bool,
+    user_message_id: str | None = None,
+    retry_of_run_id: str = "",
+) -> EventSourceResponse:
     from backend.events import (
         MEMORY_COMPACTED, MEMORY_LOADED, MEMORY_UPDATED, QUERY_REWRITTEN,
+        TASK_STATUS, TEXT_DELTA, THINKING,
     )
     from backend.memory import memory_service
 
-    conv_id = req.conv_id or db.create_conversation(title=req.question[:50])
-    memory = await memory_service.prepare_turn(conv_id, req.question)
-    user_message_id = db.add_message(
-        conv_id, "user", req.question, route_requested=req.route,
+    conv_id = conv_id or db.create_conversation(title=question[:50])
+    if user_message_id is None:
+        user_message_id = db.add_message(
+            conv_id, "user", question, route_requested=route,
+        )
+    assistant_message_id = db.add_message(
+        conv_id,
+        "assistant",
+        "",
+        route_requested=route,
+        status="running",
     )
-    turn_id = memory_service.start_turn(memory, user_message_id)
+    run_id = db.create_turn_run(
+        conv_id,
+        user_message_id,
+        assistant_message_id,
+        route_requested=route,
+        request={"question": question, "route": route, "deep": deep},
+        retry_of_run_id=retry_of_run_id,
+    )
 
-    bus = EventBus(task_id=conv_id)
-    bus.emit(MEMORY_LOADED, {
-        "recent_messages": len(memory.recent_messages),
-        "summary_version": memory.thread_summary.get("version"),
-        "durable_count": len(memory.durable_memories),
-        "topic": memory.thread_state.get("current_topic", ""),
-    })
-    if memory.standalone_query != memory.original_question:
-        bus.emit(QUERY_REWRITTEN, {
-            "original": memory.original_question,
-            "standalone": memory.standalone_query,
-            "resolved_references": memory.resolved_references,
-            "topic_shift": memory.topic_shift,
-        })
-    result_holder: dict = {}
+    current_stage = "preparing"
+
+    def persist_event(ev):
+        nonlocal current_stage
+        stage_by_type = {
+            MEMORY_LOADED: "memory",
+            QUERY_REWRITTEN: "memory",
+            "route_info": "retrieving",
+            "tool_call": "retrieving",
+            "tool_result": "retrieving",
+            "deep_round": "retrieving",
+            TEXT_DELTA: "generating",
+            "citations": "generating",
+            MEMORY_UPDATED: "memory_update",
+            MEMORY_COMPACTED: "memory_update",
+        }
+        current_stage = stage_by_type.get(ev.type, current_stage)
+        if ev.type not in CHAT_TRACE_TYPES:
+            return
+        trace = _chat_trace(bus)
+        db.update_turn_run(run_id, stage=current_stage, trace=trace)
+        db.update_message(assistant_message_id, trace=trace)
+
+    bus = EventBus(task_id=run_id, on_emit=persist_event)
+    result_holder: dict[str, str] = {
+        "message_id": assistant_message_id,
+        "run_id": run_id,
+        "status": "running",
+    }
 
     async def worker():
+        nonlocal current_stage
+        turn_id: str | None = None
         try:
+            db.update_turn_run(run_id, status="retrieving", stage="memory")
+            memory = await memory_service.prepare_turn(conv_id, question)
+            turn_id = memory_service.start_turn(memory, user_message_id)
+            bus.emit(MEMORY_LOADED, {
+                "recent_messages": len(memory.recent_messages),
+                "summary_version": memory.thread_summary.get("version"),
+                "durable_count": len(memory.durable_memories),
+                "topic": memory.thread_state.get("current_topic", ""),
+            })
+            if memory.standalone_query != memory.original_question:
+                bus.emit(QUERY_REWRITTEN, {
+                    "original": memory.original_question,
+                    "standalone": memory.standalone_query,
+                    "resolved_references": memory.resolved_references,
+                    "topic_shift": memory.topic_shift,
+                })
+
             result = await run_qa(
-                bus, req.question, route=req.route, deep=req.deep, memory=memory,
+                bus, question, route=route, deep=deep, memory=memory,
             )
-            trace_types = {
-                "memory_loaded", "query_rewritten", "thinking", "route_info", "tool_call",
-                "tool_result", "deep_round", "memory_compacted", "memory_updated",
-            }
-            trace = [
-                {"type": ev.type, "data": ev.data, "ts": ev.ts}
-                for ev in bus.history if ev.type in trace_types
-            ]
-            # 落库放在 worker 里:即使客户端断线,回答也不丢
-            msg_id = db.add_message(
-                conv_id, "assistant", result["answer"],
-                route_requested=result["route_requested"],
-                route_used=result["route_used"],
-                citations=result["citations"],
-                trace=trace,
-                model=result["model"],
-                latency_ms=result["latency_ms"],
-            )
-            result_holder["message_id"] = msg_id
             try:
                 memory_result = memory_service.complete_turn(
-                    memory, turn_id, user_message_id, msg_id, result["answer"],
+                    memory,
+                    turn_id,
+                    user_message_id,
+                    assistant_message_id,
+                    result["answer"],
                     result["citations"],
                 )
                 bus.emit(MEMORY_UPDATED, {
@@ -127,35 +184,149 @@ async def chat(req: ChatRequest):
                 if memory_result.get("compacted"):
                     bus.emit(MEMORY_COMPACTED, memory_result["compacted"])
             except Exception:
-                # Memory is an enhancement layer: a persistence or compaction
-                # failure must never discard an otherwise valid answer.
                 logger.exception("记忆更新失败，回答已正常保存")
-            finally:
-                final_trace = [
-                    {"type": ev.type, "data": ev.data, "ts": ev.ts}
-                    for ev in bus.history if ev.type in trace_types
-                ]
-                db.update_message_trace(msg_id, final_trace)
-        except Exception:
-            memory_service.fail_turn(turn_id)
-            logger.exception("问答执行失败")
+
+            bus.emit(TASK_STATUS, {
+                "status": "done",
+                "stage": "completed",
+                "run_id": run_id,
+                "latency_ms": result["latency_ms"],
+            })
+            trace = _chat_trace(bus)
+            db.update_message(
+                assistant_message_id,
+                content=result["answer"],
+                route_used=result["route_used"],
+                citations=result["citations"],
+                trace=trace,
+                model=result["model"],
+                latency_ms=result["latency_ms"],
+                status="completed",
+                error={},
+                run_id=run_id,
+            )
+            db.update_turn_run(
+                run_id,
+                status="completed",
+                stage="completed",
+                route_used=result["route_used"],
+                model=result["model"],
+                trace=trace,
+                finished=True,
+            )
+            result_holder["status"] = "completed"
+        except Exception as exc:
+            if turn_id is not None:
+                memory_service.fail_turn(turn_id)
+            error = _safe_chat_error(exc)
+            logger.exception("问答执行失败 run_id=%s stage=%s", run_id, current_stage)
+            bus.emit(THINKING, {
+                "text": "本轮执行失败",
+                "stage": current_stage,
+                "status": "failed",
+                "detail": error["message"],
+            })
+            bus.emit(TASK_STATUS, {
+                "status": "failed",
+                "stage": current_stage,
+                "run_id": run_id,
+                "error": error["message"],
+                "error_code": error["code"],
+            })
+            partial_answer = "".join(
+                str(ev.data.get("delta", ""))
+                for ev in bus.history if ev.type == TEXT_DELTA
+            )
+            trace = _chat_trace(bus)
+            db.update_message(
+                assistant_message_id,
+                content=partial_answer,
+                trace=trace,
+                status="failed",
+                error={**error, "stage": current_stage},
+                run_id=run_id,
+            )
+            db.update_turn_run(
+                run_id,
+                status="failed",
+                stage=current_stage,
+                error_code=error["code"],
+                error_message=error["message"],
+                trace=trace,
+                finished=True,
+            )
+            result_holder["status"] = "failed"
         finally:
             bus.close()
 
     task = asyncio.create_task(worker())
 
     async def event_stream():
-        # 首个事件:告知 conv_id(新会话时前端需要)
-        yield {"event": "meta", "data": f'{{"conv_id": "{conv_id}"}}'}
+        yield {
+            "event": "meta",
+            "data": json.dumps({
+                "conv_id": conv_id,
+                "run_id": run_id,
+                "message_id": assistant_message_id,
+            }),
+        }
         async for ev in bus.subscribe():
             yield {"event": ev.type, "id": str(ev.seq), "data": ev.to_json()}
         await task
-        # 回答已落库,推送 message_id(前端打分用)
-        if result_holder.get("message_id"):
-            yield {"event": "saved",
-                   "data": f'{{"message_id": "{result_holder["message_id"]}"}}'}
+        yield {
+            "event": "saved",
+            "data": json.dumps(result_holder),
+        }
 
     return EventSourceResponse(event_stream())
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    """问答:SSE 流式返回事件，并持久化运行状态和失败轨迹。"""
+    if req.route not in ROUTES:
+        raise HTTPException(400, f"route 必须是 {ROUTES}")
+    question = req.question.strip()
+    if not question:
+        raise HTTPException(400, "question 不能为空")
+    return await _start_chat_run(
+        question=question,
+        route=req.route,
+        conv_id=req.conv_id,
+        deep=req.deep,
+    )
+
+
+@app.get("/api/runs/{run_id}")
+async def chat_run_detail(run_id: str):
+    run = db.get_turn_run(run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+    return run
+
+
+@app.post("/api/runs/{run_id}/retry")
+async def retry_chat_run(run_id: str):
+    run = db.get_turn_run(run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+    if run["status"] != "failed":
+        raise HTTPException(409, "only failed runs can be retried")
+    user_message = db.get_message(run["user_message_id"])
+    if not user_message:
+        raise HTTPException(409, "source user message is missing")
+    request = run.get("request") or {}
+    route = str(request.get("route") or run.get("route_requested") or "mix")
+    if route not in ROUTES:
+        route = "mix"
+    return await _start_chat_run(
+        question=str(user_message["content"]),
+        route=route,
+        conv_id=str(run["conv_id"]),
+        deep=bool(request.get("deep", False)),
+        user_message_id=str(run["user_message_id"]),
+        retry_of_run_id=run_id,
+    )
 
 
 # ---------------- 头脑风暴(选题顾问) ----------------

@@ -11,7 +11,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 # 事件类型常量(前端/CLI 依据 type 渲染)
 PHASE = "phase"                    # {name, status: start|end}
@@ -58,9 +58,15 @@ class Event:
 class EventBus:
     """单任务事件总线:内存队列(实时消费)+ JSONL 落盘(回放)。"""
 
-    def __init__(self, task_id: str, jsonl_path: Path | None = None):
+    def __init__(
+        self,
+        task_id: str,
+        jsonl_path: Path | None = None,
+        on_emit: Callable[[Event], None] | None = None,
+    ):
         self.task_id = task_id
         self.jsonl_path = jsonl_path
+        self.on_emit = on_emit
         self._seq = 0
         self._queue: asyncio.Queue[Event | None] = asyncio.Queue()
         self._history: list[Event] = []
@@ -91,6 +97,8 @@ class EventBus:
         if self.jsonl_path:
             with open(self.jsonl_path, "a", encoding="utf-8") as f:
                 f.write(ev.to_json() + "\n")
+        if self.on_emit:
+            self.on_emit(ev)
         self._queue.put_nowait(ev)
         return ev
 

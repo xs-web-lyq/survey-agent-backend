@@ -32,9 +32,34 @@ CREATE TABLE IF NOT EXISTS messages (
     trace_json      TEXT DEFAULT '[]',
     model           TEXT DEFAULT '',
     latency_ms      INTEGER DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'completed',
+    error_json      TEXT DEFAULT '{}',
+    run_id          TEXT DEFAULT '',
     created_at      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conv_id, created_at);
+
+CREATE TABLE IF NOT EXISTS turn_runs (
+    id                   TEXT PRIMARY KEY,
+    conv_id              TEXT NOT NULL REFERENCES conversations(id),
+    user_message_id      TEXT NOT NULL REFERENCES messages(id),
+    assistant_message_id TEXT NOT NULL REFERENCES messages(id),
+    status               TEXT NOT NULL DEFAULT 'pending',
+    stage                TEXT NOT NULL DEFAULT 'pending',
+    route_requested      TEXT DEFAULT '',
+    route_used           TEXT DEFAULT '',
+    model                TEXT DEFAULT '',
+    error_code           TEXT DEFAULT '',
+    error_message        TEXT DEFAULT '',
+    trace_json           TEXT DEFAULT '[]',
+    request_json         TEXT DEFAULT '{}',
+    started_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    finished_at          REAL,
+    retry_of_run_id      TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_turn_runs_conv ON turn_runs(conv_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_turn_runs_retry ON turn_runs(retry_of_run_id);
 
 CREATE TABLE IF NOT EXISTS feedback (
     id            TEXT PRIMARY KEY,
@@ -50,9 +75,17 @@ CREATE INDEX IF NOT EXISTS idx_feedback_message ON feedback(message_id);
 """
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def _connect() -> sqlite3.Connection:
     db_path = settings.data_dir / "feedback.db"
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, factory=_ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
@@ -61,6 +94,22 @@ def _connect() -> sqlite3.Connection:
 def init_db() -> None:
     with _connect() as conn:
         conn.executescript(_SCHEMA)
+        # P0-A compatibility path for databases created before run persistence.
+        # P0-B replaces this bootstrap with versioned schema migrations.
+        _ensure_column(conn, "messages", "status", "TEXT NOT NULL DEFAULT 'completed'")
+        _ensure_column(conn, "messages", "error_json", "TEXT DEFAULT '{}'")
+        _ensure_column(conn, "messages", "run_id", "TEXT DEFAULT ''")
+
+
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    declaration: str,
+) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
 def _new_id(prefix: str) -> str:
@@ -115,6 +164,7 @@ def get_conversation(conv_id: str) -> dict[str, Any] | None:
         d = dict(m)
         d["citations"] = json.loads(d.pop("citations_json") or "[]")
         d["trace"] = json.loads(d.pop("trace_json") or "[]")
+        d["error"] = json.loads(d.pop("error_json") or "{}")
         d["feedback"] = fb_by_msg.get(d["id"])
         messages.append(d)
     return {**dict(row), "messages": messages}
@@ -198,19 +248,24 @@ def add_message(
     trace: list | None = None,
     model: str = "",
     latency_ms: int = 0,
+    status: str = "completed",
+    error: dict[str, Any] | None = None,
+    run_id: str = "",
 ) -> str:
     msg_id = _new_id("msg")
     with _connect() as conn:
         conn.execute(
             """INSERT INTO messages
                (id, conv_id, role, content, route_requested, route_used,
-                citations_json, trace_json, model, latency_ms, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                citations_json, trace_json, model, latency_ms, status,
+                error_json, run_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 msg_id, conv_id, role, content, route_requested, route_used,
                 json.dumps(citations or [], ensure_ascii=False),
                 json.dumps(trace or [], ensure_ascii=False),
-                model, latency_ms, time.time(),
+                model, latency_ms, status,
+                json.dumps(error or {}, ensure_ascii=False), run_id, time.time(),
             ),
         )
     return msg_id
@@ -224,6 +279,7 @@ def get_message(msg_id: str) -> dict[str, Any] | None:
     d = dict(row)
     d["citations"] = json.loads(d.pop("citations_json") or "[]")
     d["trace"] = json.loads(d.pop("trace_json") or "[]")
+    d["error"] = json.loads(d.pop("error_json") or "{}")
     return d
 
 
@@ -233,6 +289,120 @@ def update_message_trace(msg_id: str, trace: list[dict[str, Any]]) -> None:
         conn.execute(
             "UPDATE messages SET trace_json=? WHERE id=?",
             (json.dumps(trace, ensure_ascii=False), msg_id),
+        )
+
+
+def update_message(
+    msg_id: str,
+    *,
+    content: str | None = None,
+    route_used: str | None = None,
+    citations: list | None = None,
+    trace: list | None = None,
+    model: str | None = None,
+    latency_ms: int | None = None,
+    status: str | None = None,
+    error: dict[str, Any] | None = None,
+    run_id: str | None = None,
+) -> None:
+    values: dict[str, Any] = {
+        "content": content,
+        "route_used": route_used,
+        "citations_json": (
+            json.dumps(citations, ensure_ascii=False) if citations is not None else None
+        ),
+        "trace_json": json.dumps(trace, ensure_ascii=False) if trace is not None else None,
+        "model": model,
+        "latency_ms": latency_ms,
+        "status": status,
+        "error_json": json.dumps(error, ensure_ascii=False) if error is not None else None,
+        "run_id": run_id,
+    }
+    assignments = [f"{key}=?" for key, value in values.items() if value is not None]
+    params = [value for value in values.values() if value is not None]
+    if not assignments:
+        return
+    with _connect() as conn:
+        conn.execute(
+            f"UPDATE messages SET {', '.join(assignments)} WHERE id=?",
+            [*params, msg_id],
+        )
+
+
+# ---------- turn runs ----------
+
+def create_turn_run(
+    conv_id: str,
+    user_message_id: str,
+    assistant_message_id: str,
+    *,
+    route_requested: str,
+    request: dict[str, Any] | None = None,
+    retry_of_run_id: str = "",
+) -> str:
+    run_id = _new_id("run")
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO turn_runs
+               (id, conv_id, user_message_id, assistant_message_id, status, stage,
+                route_requested, trace_json, request_json, started_at, updated_at,
+                retry_of_run_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                run_id, conv_id, user_message_id, assistant_message_id,
+                "pending", "pending", route_requested, "[]",
+                json.dumps(request or {}, ensure_ascii=False), now, now,
+                retry_of_run_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE messages SET run_id=? WHERE id=?",
+            (run_id, assistant_message_id),
+        )
+    return run_id
+
+
+def get_turn_run(run_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM turn_runs WHERE id=?", (run_id,)).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["trace"] = json.loads(result.pop("trace_json") or "[]")
+    result["request"] = json.loads(result.pop("request_json") or "{}")
+    return result
+
+
+def update_turn_run(
+    run_id: str,
+    *,
+    status: str | None = None,
+    stage: str | None = None,
+    route_used: str | None = None,
+    model: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    trace: list[dict[str, Any]] | None = None,
+    finished: bool = False,
+) -> None:
+    values: dict[str, Any] = {
+        "status": status,
+        "stage": stage,
+        "route_used": route_used,
+        "model": model,
+        "error_code": error_code,
+        "error_message": error_message,
+        "trace_json": json.dumps(trace, ensure_ascii=False) if trace is not None else None,
+        "finished_at": time.time() if finished else None,
+        "updated_at": time.time(),
+    }
+    assignments = [f"{key}=?" for key, value in values.items() if value is not None]
+    params = [value for value in values.values() if value is not None]
+    with _connect() as conn:
+        conn.execute(
+            f"UPDATE turn_runs SET {', '.join(assignments)} WHERE id=?",
+            [*params, run_id],
         )
 
 
