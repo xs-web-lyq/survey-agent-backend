@@ -89,6 +89,11 @@ def load_section_checkpoint(
     data["used_queries"] = [
         str(item) for item in data.get("used_queries") or [] if str(item)
     ]
+    data["round_history"] = [
+        item for item in data.get("round_history") or []
+        if isinstance(item, dict)
+    ]
+    data["stop_reason"] = str(data.get("stop_reason") or "")
     return data
 
 
@@ -104,6 +109,8 @@ def save_section_checkpoint(
     round_no: int,
     max_rounds: int,
     status: str,
+    round_history: list[dict[str, Any]] | None = None,
+    stop_reason: str = "",
 ) -> dict[str, Any]:
     groups = _normalized_groups(evidence_by_question)
     coverage = assess_coverage(research_questions, groups)
@@ -120,6 +127,8 @@ def save_section_checkpoint(
         "used_queries": sorted(set(used_queries)),
         "evidence_by_question": groups,
         "coverage": coverage,
+        "round_history": list(round_history or []),
+        "stop_reason": str(stop_reason or ""),
     }
     fs.write_atomic(
         checkpoint_path(str(section["id"])),
@@ -141,6 +150,8 @@ def _public_section(
             "status": "pending",
             "round": 0,
             "max_rounds": 0,
+            "stop_reason": "",
+            "round_history": [],
             "coverage": assess_coverage(questions, [[] for _ in questions]),
             "questions": [
                 {
@@ -165,8 +176,11 @@ def _public_section(
             "id": f"Q{index}",
             "question": question,
             "covered": coverage_row["covered"],
+            "status": coverage_row["status"],
             "chunks": coverage_row["chunks"],
             "sources": coverage_row["sources"],
+            "missing_chunks": coverage_row["missing_chunks"],
+            "missing_sources": coverage_row["missing_sources"],
             "evidence": [
                 {
                     "chunk_id": chunk["chunk_id"],
@@ -183,6 +197,8 @@ def _public_section(
         "status": checkpoint["status"],
         "round": checkpoint["round"],
         "max_rounds": checkpoint["max_rounds"],
+        "stop_reason": checkpoint.get("stop_reason") or "",
+        "round_history": checkpoint.get("round_history") or [],
         "coverage": coverage,
         "questions": rows,
         "updated_at": checkpoint.get("updated_at"),

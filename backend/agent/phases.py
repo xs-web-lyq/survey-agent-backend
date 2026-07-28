@@ -15,9 +15,12 @@ from typing import Any
 from backend import bibliography, llm, rag_client
 from backend.agent import prompts
 from backend.agent.evidence_coverage import (
+    bind_brief_questions_to_outline,
+    build_gap_query,
     MAX_RESEARCH_QUESTIONS,
     assess_coverage,
     research_questions_for_section,
+    section_search_budget,
     select_balanced_evidence,
 )
 from backend.agent.evidence_store import (
@@ -55,7 +58,6 @@ LENGTH_PRESETS = {
     "long":   {"range": "1200~1800 字", "evidence": 20, "clip": 2000},
 }
 DEFAULT_LENGTH = "medium"
-SECTION_SEARCH_MAX_ROUNDS = MAX_RESEARCH_QUESTIONS
 CITATION_VERIFY_CONCURRENCY = 4
 
 
@@ -95,11 +97,31 @@ def _outline_to_md(outline: dict, topic: str) -> str:
         md += f"## {s['id']} {s['title']}\n"
         for p in s.get("points", []):
             md += f"- {p}\n"
+        questions = research_questions_for_section(s)
+        if questions:
+            md += "\n### 研究问题\n"
+            for question in questions:
+                md += f"- {question}\n"
         md += "\n"
     return md
 
 
-def _validate_outline(raw: Any, topic: str) -> dict | None:
+def _brief_questions(research_brief: dict[str, Any] | None) -> list[str]:
+    if not isinstance(research_brief, dict):
+        return []
+    return [
+        str(question).strip()
+        for question in research_brief.get("research_questions") or []
+        if str(question).strip()
+    ][:MAX_RESEARCH_QUESTIONS]
+
+
+def _validate_outline(
+    raw: Any,
+    topic: str,
+    *,
+    brief_questions: list[str] | None = None,
+) -> dict | None:
     """校验用户提交的大纲(update_outline payload)。
 
     返回规范化后的大纲;不合法返回 None。id 按数组顺序重编号 01..0n,
@@ -119,12 +141,20 @@ def _validate_outline(raw: Any, topic: str) -> dict | None:
             return None
         points = [str(p).strip() for p in (s.get("points") or [])
                   if str(p).strip()]
+        research_questions = [
+            str(question).strip()
+            for question in (s.get("research_questions") or [])
+            if str(question).strip()
+        ][:MAX_RESEARCH_QUESTIONS]
         queries = [str(q).strip() for q in (s.get("queries") or [])
                    if str(q).strip()] or [title]
         sections.append({"id": f"{len(sections) + 1:02d}", "title": title,
-                         "points": points, "queries": queries})
+                         "points": points,
+                         "research_questions": research_questions or points[:MAX_RESEARCH_QUESTIONS] or [title],
+                         "queries": queries})
     title = str(raw.get("title", "")).strip() or topic
-    return {"title": title, "sections": sections}
+    outline = {"title": title, "sections": sections}
+    return bind_brief_questions_to_outline(outline, brief_questions or [])
 
 
 async def phase_outline(bus: EventBus, state: SurveyState, *, auto_approve: bool) -> None:
@@ -160,6 +190,9 @@ async def phase_outline(bus: EventBus, state: SurveyState, *, auto_approve: bool
         )
     user_parts.append("知识库探查结果:\n" + json.dumps(scope, ensure_ascii=False)[:8000])
     outline = await _llm_json(prompts.OUTLINE_SYSTEM, "\n\n".join(user_parts))
+    outline = bind_brief_questions_to_outline(
+        outline, _brief_questions(state.research_brief),
+    )
     state.outline = outline
     state.fs.write("outline.md", _outline_to_md(outline, state.topic))
     bus.emit(FILE_WRITE, {"path": "outline.md"})
@@ -174,7 +207,11 @@ async def phase_outline(bus: EventBus, state: SurveyState, *, auto_approve: bool
         kind = reply.get("kind")
 
         if kind == "update_outline":
-            validated = _validate_outline(reply.get("payload"), state.topic)
+            validated = _validate_outline(
+                reply.get("payload"),
+                state.topic,
+                brief_questions=_brief_questions(state.research_brief),
+            )
             if validated is None:
                 bus.emit(THINKING, {"text": "提交的大纲格式无效,已忽略;请重新提交或确认。"})
                 continue
@@ -192,8 +229,16 @@ async def phase_outline(bus: EventBus, state: SurveyState, *, auto_approve: bool
                 prompts.OUTLINE_SYSTEM,
                 f"综述主题:{state.topic}\n\n知识库探查结果:\n"
                 + json.dumps(scope, ensure_ascii=False)[:8000]
+                + (
+                    "\n\n已确认的结构化研究简报:\n"
+                    + json.dumps(state.research_brief, ensure_ascii=False)[:6000]
+                    if state.research_brief else ""
+                )
                 + f"\n\n用户对上稿大纲的修改意见(必须遵守):{reply.get('text', '')}"
                 + f"\n\n上稿大纲:{json.dumps(state.outline, ensure_ascii=False)}",
+            )
+            outline = bind_brief_questions_to_outline(
+                outline, _brief_questions(state.research_brief),
             )
             state.outline = outline
             state.fs.write("outline.md", _outline_to_md(outline, state.topic))
@@ -366,6 +411,7 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
             evidence_by_question = prior_checkpoint["evidence_by_question"]
             used_queries = set(prior_checkpoint["used_queries"])
             completed_round = int(prior_checkpoint.get("round") or 0)
+            round_history = list(prior_checkpoint.get("round_history") or [])
             bus.emit(THINKING, {
                 "stage": f"section_{idx}_checkpoint",
                 "status": "completed",
@@ -379,6 +425,7 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
             evidence_by_question = [[] for _ in research_questions]
             used_queries = set()
             completed_round = 0
+            round_history = []
 
         question_seen: list[set[str]] = [
             {
@@ -399,8 +446,17 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
         coverage = assess_coverage(research_questions, evidence_by_question)
         start_round = completed_round + 1
         last_round = completed_round
+        max_rounds = section_search_budget(len(research_questions))
+        stop_reason = ""
+        stagnant_gap_rounds = 0
+        for history_item in reversed(round_history):
+            if history_item.get("strategy") in {"initial_query", "research_question"}:
+                break
+            if int(history_item.get("new_question_chunks") or 0) > 0:
+                break
+            stagnant_gap_rounds += 1
 
-        for qi in range(start_round, SECTION_SEARCH_MAX_ROUNDS + 1):
+        for qi in range(start_round, max_rounds + 1):
             last_round = qi
             if qi <= len(research_questions):
                 question_index = qi - 1
@@ -409,18 +465,38 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
                     if question_index < len(suggested_queries)
                     else research_questions[question_index]
                 )
+                strategy = (
+                    "initial_query"
+                    if question_index < len(suggested_queries)
+                    else "research_question"
+                )
             else:
                 uncovered = [
                     index for index, row in enumerate(coverage["questions"])
                     if not row["covered"]
                 ]
-                question_index = min(
+                question_index = max(
                     uncovered or range(len(research_questions)),
-                    key=lambda index: len(question_seen[index]),
+                    key=lambda index: (
+                        int(coverage["questions"][index]["missing_sources"])
+                        + int(coverage["questions"][index]["missing_chunks"]),
+                        -len(question_seen[index]),
+                    ),
                 )
-                q = f"{sec['title']} {research_questions[question_index]} 实证结果 作用机制"
+                gap_row = dict(coverage["questions"][question_index])
+                if not coverage["source_diversity_met"]:
+                    gap_row["missing_sources"] = max(
+                        int(gap_row["missing_sources"]),
+                        int(coverage["required_sources"]) - int(coverage["source_count"]),
+                    )
+                q, strategy = build_gap_query(
+                    sec,
+                    research_questions[question_index],
+                    gap_row,
+                    attempt=qi - len(research_questions),
+                )
             if q in used_queries:
-                q = f"{q} 对比研究"
+                q = f"{q} 第{qi}轮"
             used_queries.add(q)
 
             call_id = f"w{idx}-{qi}"
@@ -432,19 +508,41 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
             })
             bus.emit(TOOL_CALL, {"tool": "search_evidence", "call_id": call_id,
                                  "args": {"query": q,
-                                          "research_question": research_questions[question_index]}})
+                                          "research_question": research_questions[question_index],
+                                          "strategy": strategy}})
             result = await retrieval.search_evidence(
                 q, chunk_top_k=6, allowed_sources=scope_set)
+            question_chunks_before = len(question_seen[question_index])
             for chunk in result["chunks"]:
                 chunk_id = chunk["chunk_id"]
                 if chunk_id not in question_seen[question_index]:
                     question_seen[question_index].add(chunk_id)
                     evidence_by_question[question_index].append(chunk)
+            new_question_chunks = (
+                len(question_seen[question_index]) - question_chunks_before
+            )
             fresh = [c for c in result["chunks"] if c["chunk_id"] not in seen_ids]
             for c in fresh:
                 seen_ids.add(c["chunk_id"])
             evidence.extend(fresh)
             coverage = assess_coverage(research_questions, evidence_by_question)
+            is_gap_round = qi > len(research_questions)
+            if is_gap_round:
+                stagnant_gap_rounds = (
+                    stagnant_gap_rounds + 1 if new_question_chunks == 0 else 0
+                )
+            round_history.append({
+                "round": qi,
+                "question_id": f"Q{question_index + 1}",
+                "question": research_questions[question_index],
+                "query": q,
+                "strategy": strategy,
+                "new_question_chunks": new_question_chunks,
+                "new_unique_chunks": len(fresh),
+                "coverage_ratio": coverage["coverage_ratio"],
+                "covered_questions": coverage["covered_questions"],
+                "source_count": coverage["source_count"],
+            })
             bus.emit(TOOL_RESULT, {
                 "call_id": call_id,
                 "summary": (
@@ -455,6 +553,15 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
             })
             all_questions_searched = qi >= len(research_questions)
             enough = all_questions_searched and coverage["sufficient"]
+            plateau = (
+                all_questions_searched
+                and not enough
+                and stagnant_gap_rounds >= 2
+            )
+            if enough:
+                stop_reason = "coverage_satisfied"
+            elif plateau:
+                stop_reason = "plateau"
             checkpoint_status = "ready" if enough else "retrieving"
             save_section_checkpoint(
                 state.fs,
@@ -465,8 +572,10 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
                 evidence_by_question=evidence_by_question,
                 used_queries=used_queries,
                 round_no=qi,
-                max_rounds=SECTION_SEARCH_MAX_ROUNDS,
+                max_rounds=max_rounds,
                 status=checkpoint_status,
+                round_history=round_history,
+                stop_reason=stop_reason,
             )
             state.mark_checkpoint(
                 "evidence",
@@ -500,6 +609,16 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
                     "coverage": coverage,
                 })
                 break
+            if plateau:
+                bus.emit(DEEP_ROUND, {
+                    "round": qi,
+                    "verdict": "plateau",
+                    "gap": coverage["gap"],
+                    "new_chunks": len(fresh),
+                    "section": sec["id"],
+                    "coverage": coverage,
+                })
+                break
             bus.emit(DEEP_ROUND, {
                 "round": qi,
                 "verdict": "insufficient",
@@ -510,6 +629,8 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
             })
 
         if not coverage["sufficient"]:
+            if not stop_reason:
+                stop_reason = "budget_exhausted"
             save_section_checkpoint(
                 state.fs,
                 task_id=state.task_id,
@@ -519,14 +640,17 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
                 evidence_by_question=evidence_by_question,
                 used_queries=used_queries,
                 round_no=last_round,
-                max_rounds=SECTION_SEARCH_MAX_ROUNDS,
+                max_rounds=max_rounds,
                 status="partial",
+                round_history=round_history,
+                stop_reason=stop_reason,
             )
             state.mark_checkpoint(
                 "evidence",
                 "partial",
                 section_id=sec["id"],
                 round=last_round,
+                stop_reason=stop_reason,
                 covered_questions=coverage["covered_questions"],
                 total_questions=coverage["total_questions"],
             )
@@ -538,7 +662,11 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
             bus.emit(THINKING, {
                 "stage": f"section_{idx}_evidence_final",
                 "status": "completed",
-                "text": "已达到本节最大检索轮次",
+                "text": (
+                    "连续补证未发现新增有效证据"
+                    if stop_reason == "plateau"
+                    else "已达到本节最大检索轮次"
+                ),
                 "detail": (
                     f"最终覆盖 {coverage['covered_questions']}/{coverage['total_questions']} "
                     f"个研究问题，{coverage['source_count']} 个独立来源；"
@@ -570,8 +698,10 @@ async def phase_write_sections(bus: EventBus, state: SurveyState) -> None:
             evidence_by_question=evidence_by_question,
             used_queries=used_queries,
             round_no=last_round,
-            max_rounds=SECTION_SEARCH_MAX_ROUNDS,
+            max_rounds=max_rounds,
             status="written",
+            round_history=round_history,
+            stop_reason=stop_reason or "coverage_satisfied",
         )
         bus.emit(EVIDENCE_MATRIX_UPDATED, {
             "section": sec["id"],
@@ -619,6 +749,7 @@ async def phase_supplement_section(
     bus.emit(PHASE, {"name": "supplement", "status": "start"})
     evidence_by_question = checkpoint["evidence_by_question"]
     used_queries = set(checkpoint["used_queries"])
+    round_history = list(checkpoint.get("round_history") or [])
     question_seen = {
         str(chunk.get("chunk_id") or "")
         for chunk in evidence_by_question[question_index]
@@ -669,6 +800,18 @@ async def phase_supplement_section(
                 fresh.append(chunk)
         new_chunks += len(fresh)
         coverage = assess_coverage(research_questions, evidence_by_question)
+        round_history.append({
+            "round": round_no,
+            "question_id": question_id,
+            "question": question,
+            "query": query,
+            "strategy": "manual_supplement",
+            "new_question_chunks": len(fresh),
+            "new_unique_chunks": len(fresh),
+            "coverage_ratio": coverage["coverage_ratio"],
+            "covered_questions": coverage["covered_questions"],
+            "source_count": coverage["source_count"],
+        })
         status = "ready" if coverage["sufficient"] else "retrieving"
         save_section_checkpoint(
             state.fs,
@@ -681,6 +824,10 @@ async def phase_supplement_section(
             round_no=round_no,
             max_rounds=max_round,
             status=status,
+            round_history=round_history,
+            stop_reason=(
+                "coverage_satisfied" if coverage["sufficient"] else ""
+            ),
         )
         state.mark_checkpoint(
             "evidence_supplement",
@@ -733,6 +880,12 @@ async def phase_supplement_section(
         round_no=last_round,
         max_rounds=max_round,
         status="written",
+        round_history=round_history,
+        stop_reason=(
+            "coverage_satisfied"
+            if coverage["sufficient"]
+            else "manual_supplement_exhausted"
+        ),
     )
     bus.emit(EVIDENCE_MATRIX_UPDATED, {
         "section": section_id,

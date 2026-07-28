@@ -1,4 +1,11 @@
-from backend.agent.evidence_coverage import assess_coverage, select_balanced_evidence
+from backend.agent.evidence_coverage import (
+    assess_coverage,
+    bind_brief_questions_to_outline,
+    build_gap_query,
+    research_questions_for_section,
+    section_search_budget,
+    select_balanced_evidence,
+)
 
 
 def _chunk(chunk_id: str, source: str) -> dict:
@@ -60,3 +67,87 @@ def test_balanced_selection_keeps_each_research_question():
     selected = select_balanced_evidence(groups, all_evidence, limit=3)
 
     assert [item["chunk_id"] for item in selected] == ["q1-a", "q2-a", "q3-a"]
+
+
+def test_explicit_section_questions_are_the_retrieval_contract():
+    section = {
+        "title": "结晶器流动",
+        "points": ["介绍工艺背景"],
+        "research_questions": ["电磁制动如何改变弯月面流速？"],
+    }
+
+    assert research_questions_for_section(section) == [
+        "电磁制动如何改变弯月面流速？",
+    ]
+
+
+def test_every_brief_question_is_bound_to_an_outline_section():
+    outline = {
+        "title": "连铸电磁控制",
+        "sections": [
+            {
+                "id": "01",
+                "title": "流动与传热机理",
+                "points": ["结晶器流场"],
+                "queries": ["流场模拟"],
+            },
+            {
+                "id": "02",
+                "title": "工业应用",
+                "points": ["铸坯质量"],
+                "queries": ["工业试验"],
+            },
+        ],
+    }
+    brief_questions = [
+        "电磁制动如何改变结晶器流场？",
+        "工业应用中铸坯缺陷改善幅度是多少？",
+    ]
+
+    bound = bind_brief_questions_to_outline(outline, brief_questions)
+    assigned = [
+        question
+        for section in bound["sections"]
+        for question in section["research_questions"]
+    ]
+
+    assert all(question in assigned for question in brief_questions)
+    assert brief_questions[0] in bound["sections"][0]["research_questions"]
+    assert brief_questions[1] in bound["sections"][1]["research_questions"]
+
+
+def test_search_budget_leaves_bounded_gap_rounds():
+    assert section_search_budget(1) == 4
+    assert section_search_budget(2) == 5
+    assert section_search_budget(5) == 8
+    assert section_search_budget(99) == 8
+
+
+def test_gap_query_prioritizes_source_diversity_and_rotates_strategy():
+    section = {"title": "工业应用"}
+    row = {"missing_sources": 1, "missing_chunks": 1}
+
+    first, first_strategy = build_gap_query(
+        section, "质量改善如何", row, attempt=1,
+    )
+    second, second_strategy = build_gap_query(
+        section, "质量改善如何", row, attempt=2,
+    )
+
+    assert first_strategy == "source_diversity"
+    assert "多来源" in first
+    assert second_strategy == "quantitative_evidence"
+    assert first != second
+
+
+def test_coverage_explains_question_level_deficits():
+    coverage = assess_coverage(
+        ["工业效果如何"],
+        [[_chunk("q1-a", "a.pdf")]],
+    )
+    row = coverage["questions"][0]
+
+    assert row["status"] == "missing_sources"
+    assert row["missing_chunks"] == 1
+    assert row["missing_sources"] == 1
+    assert "证据块差 1" in coverage["gap"]

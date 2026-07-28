@@ -58,6 +58,13 @@ def test_checkpoint_and_public_matrix_have_separate_payloads(monkeypatch, tmp_pa
         round_no=2,
         max_rounds=5,
         status="ready",
+        round_history=[{
+            "round": 2,
+            "question_id": "Q2",
+            "strategy": "initial_query",
+            "new_question_chunks": 2,
+        }],
+        stop_reason="coverage_satisfied",
     )
 
     checkpoint = load_section_checkpoint(
@@ -69,10 +76,13 @@ def test_checkpoint_and_public_matrix_have_separate_payloads(monkeypatch, tmp_pa
 
     assert checkpoint is not None
     assert checkpoint["evidence_by_question"][0][0]["content"] == "A" * 300
+    assert checkpoint["stop_reason"] == "coverage_satisfied"
+    assert checkpoint["round_history"][0]["question_id"] == "Q2"
     assert matrix["summary"]["questions_covered"] == 2
     assert matrix["summary"]["sections_sufficient"] == 1
     assert matrix["sections"][0]["questions"][0]["evidence"][0]["preview"] == "A" * 180
     assert "content" not in matrix["sections"][0]["questions"][0]["evidence"][0]
+    assert matrix["sections"][0]["stop_reason"] == "coverage_satisfied"
 
 
 def test_question_changes_invalidate_old_checkpoint(monkeypatch, tmp_path):
@@ -190,6 +200,62 @@ def test_section_recovery_continues_from_next_retrieval_round(
     assert checkpoint["coverage"]["sufficient"] is True
     assert state.completed_sections == ["01"]
     assert meta["checkpoint"]["status"] == "completed"
+
+
+def test_section_search_stops_after_two_stagnant_gap_rounds(
+    monkeypatch, tmp_path,
+):
+    fs = _workspace(monkeypatch, tmp_path, "survey-plateau")
+    outline = {
+        "title": "连铸测试",
+        "sections": [{
+            "id": "01",
+            "title": "工业验证",
+            "points": ["工业效果"],
+            "research_questions": ["工业效果是否经过独立来源验证？"],
+            "queries": ["工业验证检索"],
+        }],
+    }
+    calls: list[str] = []
+
+    async def fake_search(query: str, **_kwargs):
+        calls.append(query)
+        return {"chunks": [_chunk("same-chunk", "same-source.pdf")]}
+
+    async def fake_stream(*_args, **_kwargs):
+        return "证据不足的章节内容 [E1]"
+
+    monkeypatch.setattr(
+        "backend.agent.phases.retrieval.search_evidence", fake_search,
+    )
+    monkeypatch.setattr("backend.agent.phases._llm_stream", fake_stream)
+    monkeypatch.setattr(
+        "backend.images.find_images_for_text", lambda *_args, **_kwargs: [],
+    )
+
+    state = SurveyState(
+        task_id="survey-plateau",
+        topic="连铸测试",
+        fs=fs,
+        outline=outline,
+    )
+    bus = EventBus("survey-plateau", fs.root / "events.jsonl")
+    asyncio.run(phase_write_sections(bus, state))
+    bus.close()
+
+    checkpoint = load_section_checkpoint(
+        fs,
+        "01",
+        expected_questions=outline["sections"][0]["research_questions"],
+    )
+
+    assert checkpoint is not None
+    assert len(calls) == 3
+    assert checkpoint["round"] == 3
+    assert checkpoint["status"] == "written"
+    assert checkpoint["stop_reason"] == "plateau"
+    assert len(checkpoint["round_history"]) == 3
+    assert checkpoint["round_history"][-1]["new_question_chunks"] == 0
 
 
 def test_targeted_supplement_rewrites_only_the_selected_section(
