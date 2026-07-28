@@ -22,6 +22,8 @@ class SurveyState:
     section_length: str = "medium"                       # short | medium | long
     doc_scope: list[str] = field(default_factory=list)   # 文献范围(文件名);空=全库
     context: str = ""                                    # 头脑风暴讨论结论
+    research_brief_id: str = ""
+    research_brief: dict[str, Any] = field(default_factory=dict)
     checkpoint: dict[str, Any] = field(default_factory=dict)
     input_queue: asyncio.Queue[dict] = field(default_factory=asyncio.Queue)
     pending_instructions: list[str] = field(default_factory=list)  # 用户插话
@@ -41,6 +43,8 @@ class SurveyState:
             "section_length": self.section_length,
             "doc_scope": self.doc_scope,
             "context": self.context,
+            "research_brief_id": self.research_brief_id,
+            "research_brief": self.research_brief,
             "checkpoint": self.checkpoint,
         })
         meta.setdefault("status", "running")

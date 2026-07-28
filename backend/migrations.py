@@ -62,9 +62,34 @@ def _migration_002_conversation_trash(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_003_research_briefs(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS research_briefs (
+            id             TEXT PRIMARY KEY,
+            conv_id        TEXT NOT NULL REFERENCES conversations(id),
+            version        INTEGER NOT NULL,
+            status         TEXT NOT NULL DEFAULT 'draft',
+            brief_json     TEXT NOT NULL DEFAULT '{}',
+            scope_json     TEXT NOT NULL DEFAULT '{}',
+            task_id        TEXT NOT NULL DEFAULT '',
+            created_at     REAL NOT NULL,
+            updated_at     REAL NOT NULL,
+            confirmed_at   REAL,
+            handed_off_at  REAL,
+            UNIQUE(conv_id, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_research_briefs_conv
+            ON research_briefs(conv_id, version DESC);
+        CREATE INDEX IF NOT EXISTS idx_research_briefs_task
+            ON research_briefs(task_id);
+    """)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (1, "persist chat runs and failed traces", _migration_001_chat_runs),
     (2, "soft delete conversations and add recycle bin", _migration_002_conversation_trash),
+    (3, "persist versioned research briefs and survey handoffs",
+     _migration_003_research_briefs),
 )
 
 

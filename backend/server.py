@@ -510,7 +510,137 @@ async def brainstorm_conclude(conv_id: str):
                 break
         if latest_scope:
             break
-    return await conclude_brainstorm(history, latest_scope)
+    from backend.research_briefs import normalize_brief, response
+
+    brief = normalize_brief(await conclude_brainstorm(history, latest_scope))
+    record = db.create_research_brief(conv_id, brief, scope=latest_scope)
+    return response(record)
+
+
+@app.get("/api/brainstorm/{conv_id}/briefs")
+async def brainstorm_briefs(conv_id: str):
+    from backend.research_briefs import response
+
+    if not db.get_conversation(conv_id):
+        raise HTTPException(404, "conversation not found")
+    return [response(record) for record in db.list_research_briefs(conv_id)]
+
+
+@app.get("/api/brainstorm/{conv_id}/briefs/latest")
+async def latest_brainstorm_brief(conv_id: str):
+    from backend.research_briefs import response
+
+    record = db.get_latest_research_brief(conv_id)
+    if record is None:
+        raise HTTPException(404, "research brief not found")
+    return response(record)
+
+
+class ResearchBriefUpdate(BaseModel):
+    topic: str | None = None
+    section_hints: list[str] | None = None
+    doc_keywords: list[str] | None = None
+    summary: str | None = None
+    research_questions: list[str] | None = None
+    inclusion_criteria: list[str] | None = None
+    exclusion_criteria: list[str] | None = None
+    evidence_gaps: list[str] | None = None
+
+
+class ResearchBriefHandoffRequest(BaseModel):
+    auto_approve: bool = False
+    section_length: str = "medium"
+    doc_scope: list[str] | None = None
+
+
+@app.get("/api/research-briefs/{brief_id}")
+async def research_brief_detail(brief_id: str):
+    from backend.research_briefs import response
+
+    record = db.get_research_brief(brief_id)
+    if record is None:
+        raise HTTPException(404, "research brief not found")
+    return response(record)
+
+
+@app.patch("/api/research-briefs/{brief_id}")
+async def update_research_brief(brief_id: str, req: ResearchBriefUpdate):
+    from backend.research_briefs import merge_brief, response
+
+    record = db.get_research_brief(brief_id)
+    if record is None:
+        raise HTTPException(404, "research brief not found")
+    if record["status"] == "handed_off":
+        raise HTTPException(409, "handed-off research brief is immutable")
+    patch = req.model_dump(exclude_none=True)
+    updated = db.update_research_brief(
+        brief_id,
+        merge_brief(record["brief"], patch),
+    )
+    if updated is None:
+        raise HTTPException(409, "research brief cannot be updated")
+    return response(updated)
+
+
+@app.post("/api/research-briefs/{brief_id}/confirm")
+async def confirm_research_brief(brief_id: str):
+    from backend.research_briefs import response, validation_errors
+
+    record = db.get_research_brief(brief_id)
+    if record is None:
+        raise HTTPException(404, "research brief not found")
+    errors = validation_errors(record["brief"])
+    if errors:
+        raise HTTPException(422, {"errors": errors})
+    confirmed = db.confirm_research_brief(brief_id)
+    if confirmed is None:
+        raise HTTPException(409, "research brief cannot be confirmed")
+    return response(confirmed)
+
+
+@app.post("/api/research-briefs/{brief_id}/handoff")
+async def handoff_research_brief(
+    brief_id: str,
+    req: ResearchBriefHandoffRequest,
+):
+    from backend.research_briefs import response, to_context
+    from backend.task_manager import manager
+
+    record = db.get_research_brief(brief_id)
+    if record is None:
+        raise HTTPException(404, "research brief not found")
+    if record.get("task_id"):
+        return {
+            **response(record),
+            "task_id": record["task_id"],
+            "idempotent": True,
+        }
+    if record["status"] != "confirmed":
+        raise HTTPException(409, "research brief must be confirmed before handoff")
+    if req.section_length not in {"short", "medium", "long"}:
+        raise HTTPException(400, "invalid section_length")
+
+    brief = record["brief"]
+    doc_scope = (
+        list(req.doc_scope)
+        if req.doc_scope is not None
+        else list(brief.get("doc_scope") or [])
+    )
+    task_id = f"survey-{brief_id.removeprefix('brief-')[:8]}"
+    task_id = manager.create(
+        str(brief.get("topic", "")).strip(),
+        auto_approve=req.auto_approve,
+        section_length=req.section_length,
+        doc_scope=doc_scope,
+        context=to_context(brief),
+        research_brief_id=brief_id,
+        research_brief=brief,
+        task_id=task_id,
+    )
+    handed_off = db.mark_research_brief_handed_off(brief_id, task_id)
+    if handed_off is None:
+        raise HTTPException(409, "research brief handoff state changed")
+    return {**response(handed_off), "task_id": task_id, "idempotent": False}
 
 
 # ---------------- 对话 ----------------

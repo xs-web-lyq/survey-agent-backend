@@ -65,6 +65,25 @@ CREATE TABLE IF NOT EXISTS turn_runs (
 CREATE INDEX IF NOT EXISTS idx_turn_runs_conv ON turn_runs(conv_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_turn_runs_retry ON turn_runs(retry_of_run_id);
 
+CREATE TABLE IF NOT EXISTS research_briefs (
+    id             TEXT PRIMARY KEY,
+    conv_id        TEXT NOT NULL REFERENCES conversations(id),
+    version        INTEGER NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'draft',
+    brief_json     TEXT NOT NULL DEFAULT '{}',
+    scope_json     TEXT NOT NULL DEFAULT '{}',
+    task_id        TEXT NOT NULL DEFAULT '',
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL,
+    confirmed_at   REAL,
+    handed_off_at  REAL,
+    UNIQUE(conv_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_research_briefs_conv
+    ON research_briefs(conv_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_research_briefs_task
+    ON research_briefs(task_id);
+
 CREATE TABLE IF NOT EXISTS feedback (
     id            TEXT PRIMARY KEY,
     message_id    TEXT NOT NULL REFERENCES messages(id),
@@ -240,6 +259,7 @@ def purge_conversation(
             "(SELECT id FROM messages WHERE conv_id=?)",
             (conv_id,),
         )
+        conn.execute("DELETE FROM research_briefs WHERE conv_id=?", (conv_id,))
         conn.execute("DELETE FROM turn_runs WHERE conv_id=?", (conv_id,))
         conn.execute("DELETE FROM messages WHERE conv_id=?", (conv_id,))
         scoped_tables = (
@@ -290,6 +310,150 @@ def fork_conversation(conv_id: str, through_message_id: str | None = None) -> st
         if through_message_id and message["id"] == through_message_id:
             break
     return new_id
+
+
+# ---------- research briefs ----------
+
+def _decode_research_brief(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    result = dict(row)
+    result["brief"] = json.loads(result.pop("brief_json") or "{}")
+    result["scope"] = json.loads(result.pop("scope_json") or "{}")
+    return result
+
+
+def create_research_brief(
+    conv_id: str,
+    brief: dict[str, Any],
+    *,
+    scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    brief_id = _new_id("brief")
+    now = time.time()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) + 1 AS version "
+            "FROM research_briefs WHERE conv_id=?",
+            (conv_id,),
+        ).fetchone()
+        version = int(row["version"])
+        conn.execute(
+            """INSERT INTO research_briefs
+               (id, conv_id, version, status, brief_json, scope_json,
+                created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                brief_id, conv_id, version, "draft",
+                json.dumps(brief, ensure_ascii=False),
+                json.dumps(scope or {}, ensure_ascii=False),
+                now, now,
+            ),
+        )
+        created = conn.execute(
+            "SELECT * FROM research_briefs WHERE id=?", (brief_id,)
+        ).fetchone()
+    result = _decode_research_brief(created)
+    assert result is not None
+    return result
+
+
+def get_research_brief(brief_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM research_briefs WHERE id=?", (brief_id,)
+        ).fetchone()
+    return _decode_research_brief(row)
+
+
+def get_latest_research_brief(conv_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM research_briefs
+               WHERE conv_id=? ORDER BY version DESC LIMIT 1""",
+            (conv_id,),
+        ).fetchone()
+    return _decode_research_brief(row)
+
+
+def list_research_briefs(conv_id: str) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM research_briefs
+               WHERE conv_id=? ORDER BY version DESC""",
+            (conv_id,),
+        ).fetchall()
+    return [
+        decoded for row in rows
+        if (decoded := _decode_research_brief(row)) is not None
+    ]
+
+
+def update_research_brief(
+    brief_id: str,
+    brief: dict[str, Any],
+    *,
+    reset_to_draft: bool = True,
+) -> dict[str, Any] | None:
+    now = time.time()
+    with _connect() as conn:
+        current = conn.execute(
+            "SELECT status FROM research_briefs WHERE id=?", (brief_id,)
+        ).fetchone()
+        if current is None or current["status"] == "handed_off":
+            return None
+        status = "draft" if reset_to_draft else str(current["status"])
+        conn.execute(
+            """UPDATE research_briefs
+               SET brief_json=?, status=?, updated_at=?,
+                   confirmed_at=CASE WHEN ?='draft' THEN NULL ELSE confirmed_at END
+               WHERE id=?""",
+            (
+                json.dumps(brief, ensure_ascii=False), status, now,
+                status, brief_id,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM research_briefs WHERE id=?", (brief_id,)
+        ).fetchone()
+    return _decode_research_brief(row)
+
+
+def confirm_research_brief(brief_id: str) -> dict[str, Any] | None:
+    now = time.time()
+    with _connect() as conn:
+        cursor = conn.execute(
+            """UPDATE research_briefs
+               SET status='confirmed', confirmed_at=?, updated_at=?
+               WHERE id=? AND status IN ('draft', 'confirmed')""",
+            (now, now, brief_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        row = conn.execute(
+            "SELECT * FROM research_briefs WHERE id=?", (brief_id,)
+        ).fetchone()
+    return _decode_research_brief(row)
+
+
+def mark_research_brief_handed_off(
+    brief_id: str,
+    task_id: str,
+) -> dict[str, Any] | None:
+    now = time.time()
+    with _connect() as conn:
+        cursor = conn.execute(
+            """UPDATE research_briefs
+               SET status='handed_off', task_id=?, handed_off_at=?, updated_at=?
+               WHERE id=? AND status IN ('confirmed', 'handed_off')""",
+            (task_id, now, now, brief_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        row = conn.execute(
+            "SELECT * FROM research_briefs WHERE id=?", (brief_id,)
+        ).fetchone()
+    return _decode_research_brief(row)
 
 
 # ---------- messages ----------

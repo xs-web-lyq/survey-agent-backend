@@ -145,6 +145,11 @@ async def phase_outline(bus: EventBus, state: SurveyState, *, auto_approve: bool
 
     bus.emit(THINKING, {"text": "基于探查结果规划大纲…"})
     user_parts = [f"综述主题:{state.topic}"]
+    if state.research_brief:
+        user_parts.append(
+            "已确认的结构化研究简报（大纲必须逐项覆盖核心研究问题，并遵守纳入/排除边界）:\n"
+            + json.dumps(state.research_brief, ensure_ascii=False)[:6000]
+        )
     if state.context:
         user_parts.append(f"选题讨论结论(大纲应体现其中确定的方向与边界):\n{state.context[:2000]}")
     if scope_set:

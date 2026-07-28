@@ -55,6 +55,42 @@ def test_stale_finalize_checkpoint_is_archived(monkeypatch, tmp_path):
     assert fs.read(destination) == "旧终稿"
 
 
+def test_task_handoff_preserves_structured_research_brief(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "workspace_dir", tmp_path)
+
+    async def finish_without_model(_bus, state, *, auto_approve):
+        assert auto_approve is False
+        assert state.research_brief_id == "brief-123"
+        assert len(state.research_brief["research_questions"]) == 2
+
+    monkeypatch.setattr(task_manager_module, "run_survey", finish_without_model)
+
+    async def exercise():
+        manager = TaskManager()
+        task_id = manager.create(
+            "连铸电磁搅拌综述",
+            research_brief_id="brief-123",
+            research_brief={
+                "topic": "连铸电磁搅拌综述",
+                "research_questions": ["问题一", "问题二"],
+                "inclusion_criteria": ["纳入连铸研究"],
+            },
+            task_id="survey-brief12",
+        )
+        await manager._tasks[task_id]
+        return manager.create(
+            "不会覆盖原任务",
+            research_brief_id="brief-other",
+            task_id="survey-brief12",
+        )
+
+    second_id = asyncio.run(exercise())
+    meta = json.loads(WorkspaceFS("survey-brief12").read("task.json"))
+    assert second_id == "survey-brief12"
+    assert meta["research_brief_id"] == "brief-123"
+    assert meta["research_brief"]["research_questions"] == ["问题一", "问题二"]
+
+
 def test_failed_supplement_keeps_existing_finalize_checkpoint(
     monkeypatch, tmp_path,
 ):

@@ -85,18 +85,26 @@ class TaskManager:
 
     def create(self, topic: str, *, auto_approve: bool = False,
                section_length: str = "medium", doc_scope: list[str] | None = None,
-               context: str = "") -> str:
-        task_id = f"survey-{uuid.uuid4().hex[:8]}"
+               context: str = "", research_brief_id: str = "",
+               research_brief: dict[str, Any] | None = None,
+               task_id: str | None = None) -> str:
+        task_id = task_id or f"survey-{uuid.uuid4().hex[:8]}"
         fs = WorkspaceFS(task_id)
+        if fs.exists("task.json"):
+            return task_id
         state = SurveyState(task_id=task_id, topic=topic, fs=fs,
                             section_length=section_length,
-                            doc_scope=list(doc_scope or []), context=context)
+                            doc_scope=list(doc_scope or []), context=context,
+                            research_brief_id=research_brief_id,
+                            research_brief=dict(research_brief or {}))
         bus = EventBus(task_id=task_id, jsonl_path=fs.root / "events.jsonl")
         fs.write_atomic("task.json", json.dumps({
             "task_id": task_id, "topic": topic, "created_at": time.time(),
             "status": "running", "section_length": section_length,
             "doc_scope": list(doc_scope or []),
             "context": context,
+            "research_brief_id": research_brief_id,
+            "research_brief": dict(research_brief or {}),
         }, ensure_ascii=False, indent=2))
 
         self._buses[task_id] = bus
@@ -161,6 +169,8 @@ class TaskManager:
             section_length=str(meta.get("section_length") or "medium"),
             doc_scope=list(meta.get("doc_scope") or []),
             context=str(meta.get("context") or ""),
+            research_brief_id=str(meta.get("research_brief_id") or ""),
+            research_brief=dict(meta.get("research_brief") or {}),
             checkpoint=dict(meta.get("checkpoint") or {}),
         )
         bus = EventBus(task_id=task_id, jsonl_path=fs.root / "events.jsonl")
@@ -241,6 +251,8 @@ class TaskManager:
             section_length=str(meta.get("section_length") or "medium"),
             doc_scope=list(meta.get("doc_scope") or []),
             context=str(meta.get("context") or ""),
+            research_brief_id=str(meta.get("research_brief_id") or ""),
+            research_brief=dict(meta.get("research_brief") or {}),
             checkpoint=dict(meta.get("checkpoint") or {}),
         )
         missing = [
@@ -353,6 +365,8 @@ class TaskManager:
             section_length=str(meta.get("section_length") or "medium"),
             doc_scope=list(meta.get("doc_scope") or []),
             context=str(meta.get("context") or ""),
+            research_brief_id=str(meta.get("research_brief_id") or ""),
+            research_brief=dict(meta.get("research_brief") or {}),
             checkpoint=dict(meta.get("checkpoint") or {}),
         )
         bus = EventBus(task_id=task_id, jsonl_path=fs.root / "events.jsonl")
