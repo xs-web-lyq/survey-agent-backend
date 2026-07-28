@@ -2,6 +2,7 @@ import asyncio
 import json
 
 from backend.agent.evidence_store import (
+    MATRIX_SCHEMA_VERSION,
     load_section_checkpoint,
     read_evidence_matrix,
     save_section_checkpoint,
@@ -126,6 +127,32 @@ def test_public_matrix_uses_same_question_limit_as_retrieval(monkeypatch, tmp_pa
     assert [
         row["question"] for row in matrix["sections"][0]["questions"]
     ] == section["points"][:MAX_RESEARCH_QUESTIONS]
+
+
+def test_legacy_public_matrix_is_rebuilt_without_invalidating_checkpoints(
+    monkeypatch, tmp_path,
+):
+    fs = _workspace(monkeypatch, tmp_path)
+    outline = {
+        "title": "测试",
+        "sections": [{"id": "01", "title": "章节", "points": ["问题"]}],
+    }
+    fs.write("evidence_matrix.json", json.dumps({
+        "schema_version": 1,
+        "task_id": "survey-checkpoint",
+        "summary": {},
+        "sections": [],
+    }))
+
+    matrix = read_evidence_matrix(
+        fs, task_id="survey-checkpoint", outline=outline,
+    )
+
+    assert matrix["schema_version"] == MATRIX_SCHEMA_VERSION
+    question = matrix["sections"][0]["questions"][0]
+    assert question["status"] == "missing_evidence"
+    assert question["missing_chunks"] == 2
+    assert question["missing_sources"] == 2
 
 
 def test_section_recovery_continues_from_next_retrieval_round(

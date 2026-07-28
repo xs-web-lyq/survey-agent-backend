@@ -11,12 +11,15 @@ import time
 from typing import Any
 
 from backend.agent.evidence_coverage import (
+    MIN_CHUNKS_PER_QUESTION,
+    MIN_SOURCES_PER_QUESTION,
     assess_coverage,
     research_questions_for_section,
 )
 from backend.tools.files import WorkspaceFS
 
-SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 1
+MATRIX_SCHEMA_VERSION = 2
 MATRIX_PATH = "evidence_matrix.json"
 
 
@@ -77,7 +80,7 @@ def load_section_checkpoint(
         data = json.loads(fs.read(path))
     except (json.JSONDecodeError, OSError):
         return None
-    if data.get("schema_version") != SCHEMA_VERSION:
+    if data.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         return None
     questions = [str(item) for item in data.get("research_questions") or []]
     if expected_questions is not None and questions != expected_questions:
@@ -115,7 +118,7 @@ def save_section_checkpoint(
     groups = _normalized_groups(evidence_by_question)
     coverage = assess_coverage(research_questions, groups)
     payload = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "task_id": task_id,
         "section_id": str(section["id"]),
         "section_title": str(section.get("title") or ""),
@@ -158,8 +161,11 @@ def _public_section(
                     "id": f"Q{index}",
                     "question": question,
                     "covered": False,
+                    "status": "missing_evidence",
                     "chunks": 0,
                     "sources": 0,
+                    "missing_chunks": MIN_CHUNKS_PER_QUESTION,
+                    "missing_sources": MIN_SOURCES_PER_QUESTION,
                     "evidence": [],
                 }
                 for index, question in enumerate(questions, 1)
@@ -234,7 +240,7 @@ def rebuild_evidence_matrix(
         int(bool(section["coverage"]["sufficient"])) for section in sections
     )
     matrix = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": MATRIX_SCHEMA_VERSION,
         "task_id": task_id,
         "updated_at": time.time(),
         "summary": {
@@ -259,7 +265,7 @@ def read_evidence_matrix(
     if fs.exists(MATRIX_PATH):
         try:
             matrix = json.loads(fs.read(MATRIX_PATH))
-            if matrix.get("schema_version") == SCHEMA_VERSION:
+            if matrix.get("schema_version") == MATRIX_SCHEMA_VERSION:
                 return matrix
         except (json.JSONDecodeError, OSError):
             pass
