@@ -985,6 +985,22 @@ async def survey_evidence_matrix(task_id: str):
     )
 
 
+@app.get("/api/tasks/{task_id}/quality-report")
+async def survey_quality_report(task_id: str):
+    """返回终稿质量门禁；报告只由确定性检查生成，不使用 LLM 自评。"""
+    from backend.tools.files import WorkspaceFS
+
+    fs = WorkspaceFS(task_id)
+    if not fs.exists("task.json"):
+        raise HTTPException(404, "task not found")
+    if not fs.exists("quality_report.json"):
+        raise HTTPException(404, "quality report is not ready")
+    try:
+        return json.loads(fs.read("quality_report.json"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(409, "quality report is invalid") from exc
+
+
 @app.post("/api/tasks/{task_id}/evidence/supplement", status_code=202)
 async def supplement_survey_evidence(
     task_id: str,
@@ -1050,7 +1066,13 @@ async def survey_export_zip(task_id: str):
             zf.write(p, arcname)
             survey = survey.replace(f"/api/kb-images/{tok}", arcname)
         zf.writestr("survey.md", survey)
-        for extra in ("references.md", "bibliography.json", "outline.md"):
+        for extra in (
+            "references.md",
+            "bibliography.json",
+            "outline.md",
+            "evidence_matrix.json",
+            "quality_report.json",
+        ):
             if fs.exists(extra):
                 zf.writestr(extra, fs.read(extra))
 

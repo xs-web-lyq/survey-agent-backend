@@ -26,10 +26,15 @@ from backend.agent.evidence_coverage import (
 from backend.agent.evidence_store import (
     MATRIX_PATH,
     load_section_checkpoint,
+    read_evidence_matrix,
     rebuild_evidence_matrix,
     save_section_checkpoint,
 )
 from backend.agent.state import SurveyState
+from backend.agent.survey_quality import (
+    build_integration_contract,
+    build_quality_report,
+)
 from backend.config import settings
 from backend.events import (
     CITATION_CHECK,
@@ -917,6 +922,15 @@ async def phase_finalize(bus: EventBus, state: SurveyState) -> dict[str, Any]:
         if state.fs.exists(rel):
             drafts.append(state.fs.read(rel))
     combined = "\n\n".join(drafts)
+    evidence_matrix = read_evidence_matrix(
+        state.fs,
+        task_id=state.task_id,
+        outline=state.outline,
+    )
+    integration_contract = build_integration_contract(
+        state.research_brief,
+        evidence_matrix,
+    )
 
     checkpoint = "finalize_draft.md"
     if state.fs.exists(checkpoint):
@@ -924,10 +938,16 @@ async def phase_finalize(bus: EventBus, state: SurveyState) -> dict[str, Any]:
         full_md = state.fs.read(checkpoint)
     else:
         bus.emit(THINKING, {"text": "整合章节、补写引言与结论…"})
+        polish_input = (
+            "【终稿整合约束（不属于正文，不要原样输出）】\n"
+            + json.dumps(integration_contract, ensure_ascii=False)
+            + "\n\n【章节草稿】\n"
+            + combined
+        )
         full_md = await _llm_stream(
             bus,
             prompts.POLISH_SYSTEM.format(survey_title=title),
-            combined,
+            polish_input,
             target="survey.md",
         )
         # 在昂贵的长文本调用后立即落检查点。后续核查失败时无需重新生成终稿。
@@ -989,7 +1009,26 @@ async def phase_finalize(bus: EventBus, state: SurveyState) -> dict[str, Any]:
     bus.emit(FILE_WRITE, {"path": "survey.md"})
     state.fs.write("references.md", refs_md)
     bus.emit(FILE_WRITE, {"path": "references.md"})
-    state.mark_checkpoint("finalize", "completed")
+    quality_report = build_quality_report(
+        task_id=state.task_id,
+        research_brief=state.research_brief,
+        evidence_matrix=evidence_matrix,
+        citations_total=len(cite_ids),
+        citations_passed=passed,
+        failed_chunk_ids=fail_ids,
+        bibliography_records=bibliography_records,
+    )
+    state.fs.write_atomic(
+        "quality_report.json",
+        json.dumps(quality_report, ensure_ascii=False, indent=2),
+    )
+    bus.emit(FILE_WRITE, {"path": "quality_report.json"})
+    state.mark_checkpoint(
+        "finalize",
+        "completed",
+        quality_status=quality_report["overall_status"],
+        quality_actions=quality_report["summary"]["gates_action_required"],
+    )
     bus.emit(PHASE, {"name": "finalize", "status": "end"})
 
     return {
@@ -1001,6 +1040,8 @@ async def phase_finalize(bus: EventBus, state: SurveyState) -> dict[str, Any]:
             item.get("metadata_status") == "complete"
             for item in bibliography_records
         ),
+        "quality_status": quality_report["overall_status"],
+        "quality_actions": quality_report["summary"]["gates_action_required"],
     }
 
 
