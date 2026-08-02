@@ -85,11 +85,31 @@ def _migration_003_research_briefs(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _migration_004_durable_run_events(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS run_events (
+            id           TEXT PRIMARY KEY,
+            run_id       TEXT NOT NULL REFERENCES turn_runs(id),
+            seq          INTEGER NOT NULL,
+            event_type   TEXT NOT NULL,
+            stage        TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at   REAL NOT NULL,
+            UNIQUE(run_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_events_run
+            ON run_events(run_id, seq);
+        CREATE INDEX IF NOT EXISTS idx_run_events_type
+            ON run_events(event_type, created_at);
+    """)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     (1, "persist chat runs and failed traces", _migration_001_chat_runs),
     (2, "soft delete conversations and add recycle bin", _migration_002_conversation_trash),
     (3, "persist versioned research briefs and survey handoffs",
      _migration_003_research_briefs),
+    (4, "append durable agent run events", _migration_004_durable_run_events),
 )
 
 

@@ -62,9 +62,9 @@ class DatabaseLifecycleTests(unittest.TestCase):
             """)
             first = apply_migrations(raw)
             second = apply_migrations(raw)
-            self.assertEqual(first, [1, 2, 3])
+            self.assertEqual(first, [1, 2, 3, 4])
             self.assertEqual(second, [])
-            self.assertEqual(current_version(raw), 3)
+            self.assertEqual(current_version(raw), 4)
             message_columns = {
                 row["name"] for row in raw.execute("PRAGMA table_info(messages)")
             }
@@ -76,6 +76,10 @@ class DatabaseLifecycleTests(unittest.TestCase):
             self.assertIsNotNone(raw.execute(
                 "SELECT 1 FROM sqlite_master "
                 "WHERE type='table' AND name='research_briefs'"
+            ).fetchone())
+            self.assertIsNotNone(raw.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='run_events'"
             ).fetchone())
 
 

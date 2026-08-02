@@ -90,6 +90,35 @@ class ChatRunPersistenceTests(unittest.TestCase):
         self.assertEqual(emitted[0]["task_id"], "run-test")
         self.assertEqual(emitted[0]["data"]["text"], "step")
 
+    def test_run_events_are_append_only_ordered_and_idempotent(self):
+        conv_id = db.create_conversation("event replay")
+        user_id = db.add_message(conv_id, "user", "question")
+        assistant_id = db.add_message(conv_id, "assistant", "", status="running")
+        run_id = db.create_turn_run(
+            conv_id, user_id, assistant_id, route_requested="mix",
+        )
+
+        db.append_run_event(
+            run_id, 1, "thinking", {"text": "plan"}, stage="planning",
+            created_at=1.0,
+        )
+        db.append_run_event(
+            run_id, 2, "tool_call", {"tool": "retrieval"},
+            stage="retrieving", created_at=2.0,
+        )
+        db.append_run_event(
+            run_id, 2, "tool_call", {"tool": "duplicate"},
+            stage="retrieving", created_at=3.0,
+        )
+
+        events = db.list_run_events(run_id)
+        self.assertEqual([event["seq"] for event in events], [1, 2])
+        self.assertEqual(events[1]["payload"]["tool"], "retrieval")
+        self.assertEqual(
+            [event["seq"] for event in db.list_run_events(run_id, after_seq=1)],
+            [2],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

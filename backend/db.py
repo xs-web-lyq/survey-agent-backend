@@ -65,6 +65,19 @@ CREATE TABLE IF NOT EXISTS turn_runs (
 CREATE INDEX IF NOT EXISTS idx_turn_runs_conv ON turn_runs(conv_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_turn_runs_retry ON turn_runs(retry_of_run_id);
 
+CREATE TABLE IF NOT EXISTS run_events (
+    id           TEXT PRIMARY KEY,
+    run_id       TEXT NOT NULL REFERENCES turn_runs(id),
+    seq          INTEGER NOT NULL,
+    event_type   TEXT NOT NULL,
+    stage        TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at   REAL NOT NULL,
+    UNIQUE(run_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_run_events_type ON run_events(event_type, created_at);
+
 CREATE TABLE IF NOT EXISTS research_briefs (
     id             TEXT PRIMARY KEY,
     conv_id        TEXT NOT NULL REFERENCES conversations(id),
@@ -260,6 +273,11 @@ def purge_conversation(
             (conv_id,),
         )
         conn.execute("DELETE FROM research_briefs WHERE conv_id=?", (conv_id,))
+        conn.execute(
+            "DELETE FROM run_events WHERE run_id IN "
+            "(SELECT id FROM turn_runs WHERE conv_id=?)",
+            (conv_id,),
+        )
         conn.execute("DELETE FROM turn_runs WHERE conv_id=?", (conv_id,))
         conn.execute("DELETE FROM messages WHERE conv_id=?", (conv_id,))
         scoped_tables = (
@@ -625,6 +643,56 @@ def update_turn_run(
             f"UPDATE turn_runs SET {', '.join(assignments)} WHERE id=?",
             [*params, run_id],
         )
+
+
+def append_run_event(
+    run_id: str,
+    seq: int,
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    stage: str = "",
+    created_at: float | None = None,
+) -> str:
+    """Append one immutable event; duplicate replay writes are idempotent."""
+    event_id = f"event-{run_id.removeprefix('run-')}-{seq}"
+    with _connect() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO run_events
+               (id, run_id, seq, event_type, stage, payload_json, created_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                event_id,
+                run_id,
+                seq,
+                event_type,
+                stage,
+                json.dumps(payload, ensure_ascii=False),
+                created_at if created_at is not None else time.time(),
+            ),
+        )
+    return event_id
+
+
+def list_run_events(
+    run_id: str,
+    *,
+    after_seq: int = 0,
+    limit: int = 1000,
+) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(limit, 5000))
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM run_events
+               WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?""",
+            (run_id, max(0, after_seq), safe_limit),
+        ).fetchall()
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        events.append(item)
+    return events
 
 
 # ---------- feedback ----------

@@ -188,6 +188,7 @@ async def _start_chat_run(
         MEMORY_COMPACTED, MEMORY_LOADED, MEMORY_UPDATED, QUERY_REWRITTEN,
         TASK_STATUS, TEXT_DELTA, THINKING,
     )
+    from backend.domain import RunEventType
     from backend.memory import memory_service
 
     conv_id = conv_id or db.create_conversation(title=question[:50])
@@ -228,6 +229,18 @@ async def _start_chat_run(
             MEMORY_COMPACTED: "memory_update",
         }
         current_stage = stage_by_type.get(ev.type, current_stage)
+        # Token deltas are transport data and would create one SQLite write per
+        # token. The final/partial message projection is already durable; the
+        # event store keeps semantic lifecycle and tool/retrieval events.
+        if ev.type != TEXT_DELTA:
+            db.append_run_event(
+                run_id,
+                ev.seq,
+                ev.type,
+                ev.data,
+                stage=current_stage,
+                created_at=ev.ts,
+            )
         if ev.type not in CHAT_TRACE_TYPES:
             return
         trace = _chat_trace(bus)
@@ -235,6 +248,11 @@ async def _start_chat_run(
         db.update_message(assistant_message_id, trace=trace)
 
     bus = EventBus(task_id=run_id, on_emit=persist_event)
+    bus.emit(RunEventType.RUN_STARTED.value, {
+        "run_id": run_id,
+        "conv_id": conv_id,
+        "retry_of_run_id": retry_of_run_id,
+    })
     result_holder: dict[str, str] = {
         "message_id": assistant_message_id,
         "run_id": run_id,
@@ -289,6 +307,11 @@ async def _start_chat_run(
                 "run_id": run_id,
                 "latency_ms": result["latency_ms"],
             })
+            bus.emit(RunEventType.RUN_COMPLETED.value, {
+                "run_id": run_id,
+                "message_id": assistant_message_id,
+                "latency_ms": result["latency_ms"],
+            })
             trace = _chat_trace(bus)
             db.update_message(
                 assistant_message_id,
@@ -329,6 +352,13 @@ async def _start_chat_run(
                 "run_id": run_id,
                 "error": error["message"],
                 "error_code": error["code"],
+            })
+            bus.emit(RunEventType.RUN_FAILED.value, {
+                "run_id": run_id,
+                "message_id": assistant_message_id,
+                "stage": current_stage,
+                "error_code": error["code"],
+                "error": error["message"],
             })
             partial_answer = "".join(
                 str(ev.data.get("delta", ""))
@@ -400,6 +430,17 @@ async def chat_run_detail(run_id: str):
     if not run:
         raise HTTPException(404, "run not found")
     return run
+
+
+@app.get("/api/runs/{run_id}/events")
+async def chat_run_events(run_id: str, after_seq: int = 0, limit: int = 1000):
+    """Replay an immutable run timeline after a reconnect or desktop restart."""
+    if not db.get_turn_run(run_id):
+        raise HTTPException(404, "run not found")
+    return {
+        "run_id": run_id,
+        "events": db.list_run_events(run_id, after_seq=after_seq, limit=limit),
+    }
 
 
 @app.post("/api/runs/{run_id}/retry")
